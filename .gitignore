@@ -1,0 +1,8 @@
+/bin/
+/__pycache__/
+*.o
+*.pyc
+*.so
+*~
+.DS_Store
+/tmp/

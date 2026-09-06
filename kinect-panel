@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Summon Kinect control panel (C). Second run raises window.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$DIR/bin/kinect_panel"
+if [[ ! -x "$BIN" ]]; then
+  echo "kinect-panel: building C binary…" >&2
+  make -C "$DIR" -s
+fi
+exec "$BIN" "$@"
