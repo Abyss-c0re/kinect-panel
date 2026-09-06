@@ -462,7 +462,7 @@ int kinect_vcam_open(const char *dev) {
   int fd;
   struct v4l2_format fmt;
   if (!dev) return -1;
-  fd = open(dev, O_RDWR);
+  fd = open(dev, O_RDWR | O_NONBLOCK);
   if (fd < 0) return -1;
   memset(&fmt, 0, sizeof fmt);
   fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;

@@ -59,7 +59,6 @@ static void *bridge_main(void *arg) {
     set_err("oom");
     goto out;
   }
-  if (!fg) fg = fg_create();
 
   if (ir) {
     if (kinect_cap_open(&cap, source, V4L2_PIX_FMT_Y10BPACK, KINECT_IR_W, KINECT_IR_H) < 0) {
@@ -73,18 +72,14 @@ static void *bridge_main(void *arg) {
     }
   }
   vfd = kinect_vcam_open(vcam);
-  if (vfd < 0) {
-    set_err("virtual cam open failed");
-    kinect_cap_close(&cap);
-    goto out;
-  }
+  /* Preview must work even if the loopback write side is missing/blocked. */
 
   pthread_mutex_lock(&mu);
   running = 1;
   pthread_mutex_unlock(&mu);
 
   while (!stop_flag) {
-    uint8_t rgb[KINECT_RGB_W * KINECT_RGB_H * 3];
+    uint8_t *rgb = fgbuf;
     if (kinect_cap_frame(&cap, raw, raw_len) < 0) {
       usleep(20000);
       continue;
@@ -137,28 +132,39 @@ static void *bridge_main(void *arg) {
         }
       }
     }
+    /* Always publish the real frame to the panel first. */
+    pthread_mutex_lock(&mu);
+    memcpy(preview, rgb, sizeof preview);
+    have_preview = 1;
+    pthread_mutex_unlock(&mu);
+
     {
-      int nout, fi, mid;
+      int nout = 1, fi, mid;
+      uint8_t *gen = NULL;
       pthread_mutex_lock(&mu);
       mid = fg_boost;
       pthread_mutex_unlock(&mu);
-      if (fg) {
+      if (mid > 0 && !fg) fg = fg_create();
+      if (fg && mid > 0) {
         fg_set_boost(fg, mid);
         nout = fg_push_rgb(fg, rgb);
-      } else {
-        nout = 1;
+        if (nout < 1) nout = 1;
+        gen = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
       }
       for (fi = 0; fi < nout; fi++) {
         uint8_t *fr = rgb;
-        if (fg && fg_copy(fg, fi, fgbuf) == 0) fr = fgbuf;
-        kinect_rgb_to_yuyv(fr, yuyv);
-        if (kinect_vcam_write_yuyv(vfd, yuyv) < 0) usleep(4000);
+        if (gen && fg_copy(fg, fi, gen) == 0) fr = gen;
         pthread_mutex_lock(&mu);
         memcpy(preview, fr, sizeof preview);
         have_preview = 1;
         pthread_mutex_unlock(&mu);
-        if (fi + 1 < nout) usleep(8000);
+        if (vfd >= 0) {
+          kinect_rgb_to_yuyv(fr, yuyv);
+          (void)kinect_vcam_write_yuyv(vfd, yuyv);
+        }
+        if (fi + 1 < nout) usleep(6000);
       }
+      free(gen);
     }
   }
 

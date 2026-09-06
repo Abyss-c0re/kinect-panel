@@ -591,6 +591,13 @@ static gboolean preview_tick(gpointer u) {
     if (kinect_cloud_running() || kinect_cloud_live()) refresh_dev();
     return TRUE;
   }
+  if (camera_on && kinect_bridge_running()) {
+    uint8_t *rgb = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
+    if (rgb && kinect_bridge_preview_rgb(rgb) == 0)
+      show_rgb(rgb, KINECT_RGB_W, KINECT_RGB_H);
+    free(rgb);
+    return TRUE;
+  }
   if (preview_on && !bridge_starting) snap_async();
   if (camera_on && !bridge_starting && !live_ok()) {
     const char *e = is_cloud() ? kinect_cloud_error() : kinect_bridge_error();
