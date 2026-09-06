@@ -1,19 +1,25 @@
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
-/* Live depth in-process. No fork, no freenect_sync (those crash GTK + hold USB). */
+/* One USB owner. Motor inhibited. Live frames only. Dump via posix_spawn if needed. */
 #include "kinect_cloud_view.h"
 #include "cube_kinect_cloud.h"
 #include "cube_paths.h"
 #include "kinect_motor.h"
 #include "kinect_v4l.h"
 
+#include <fcntl.h>
 #include <libfreenect.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define DEP_W 640
 #define DEP_H 480
@@ -21,7 +27,7 @@
 
 static pthread_t th;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-static int started, running, stop_flag;
+static int started, running, stop_flag, live_frames;
 static char err[160];
 static uint8_t *front, *back;
 static int have_preview, npoints;
@@ -61,55 +67,116 @@ static void paint(cube_cloud *cloud, float e, float a, float d) {
   back = tmp;
   have_preview = 1;
   npoints = cloud->n;
-  if (cloud->n > 0) err[0] = 0;
   pthread_mutex_unlock(&mu);
 }
 
-static void *cloud_main(void *arg) {
-  cube_cloud cloud;
+static int find_dump(char *out, size_t n) {
+  char self[4096], dir[4096], *slash;
+  ssize_t k;
+  const char *cands[6];
+  int i;
+  k = readlink("/proc/self/exe", self, sizeof self - 1);
+  dir[0] = 0;
+  if (k > 0) {
+    self[k] = 0;
+    slash = strrchr(self, '/');
+    if (slash) {
+      *slash = 0;
+      snprintf(dir, sizeof dir, "%s", self);
+    }
+  }
+  cands[0] = getenv("KINECT_DEPTH_DUMP");
+  cands[1] = dir[0] ? dir : NULL;
+  cands[2] = "/home/voldemar/Dev/lab/kinect-panel/bin/kinect_depth_dump";
+  cands[3] = "/home/voldemar/Dev/lab/prophecy_cube/os/trackers/kinect_depth_dump";
+  cands[4] = NULL;
+  if (dir[0]) {
+    snprintf(out, n, "%s/kinect_depth_dump", dir);
+    if (access(out, X_OK) == 0) return 0;
+  }
+  for (i = 0; cands[i]; i++) {
+    if (!cands[i][0]) continue;
+    if (i == 1) continue;
+    if (access(cands[i], X_OK) == 0) {
+      snprintf(out, n, "%s", cands[i]);
+      return 0;
+    }
+  }
+  return -1;
+}
+
+static int spawn_dump(const char *bin, const char *xyz) {
+  pid_t pid = 0;
+  int st = 0;
+  char *argv[5];
+  posix_spawn_file_actions_t fa;
+  argv[0] = (char *)bin;
+  argv[1] = (char *)xyz;
+  argv[2] = "4";
+  argv[3] = NULL;
+  if (posix_spawn_file_actions_init(&fa) != 0) return -1;
+  posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+  if (posix_spawn(&pid, bin, &fa, NULL, argv, environ) != 0) {
+    posix_spawn_file_actions_destroy(&fa);
+    return -1;
+  }
+  posix_spawn_file_actions_destroy(&fa);
+  if (waitpid(pid, &st, 0) < 0) return -1;
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+}
+
+static int loop_dump(cube_cloud *cloud) {
+  char bin[512];
+  if (find_dump(bin, sizeof bin) < 0) {
+    set_err("no kinect_depth_dump");
+    return -1;
+  }
+  pthread_mutex_lock(&mu);
+  running = 1;
+  pthread_mutex_unlock(&mu);
+  while (!stop_flag) {
+    float e, a, d;
+    pthread_mutex_lock(&mu);
+    e = elev;
+    a = azim;
+    d = dist;
+    pthread_mutex_unlock(&mu);
+    if (spawn_dump(bin, CUBE_KINECT_XYZ) == 0 &&
+        cube_cloud_load_xyz(cloud, CUBE_KINECT_XYZ, CUBE_CLOUD_MAX) == 0 &&
+        cloud->n > 0) {
+      paint(cloud, e, a, d);
+      pthread_mutex_lock(&mu);
+      live_frames++;
+      err[0] = 0;
+      pthread_mutex_unlock(&mu);
+    } else
+      set_err("dump failed (Kinect busy?)");
+    usleep(120000);
+  }
+  return 0;
+}
+
+static int loop_live(cube_cloud *cloud) {
   freenect_context *ctx = NULL;
   freenect_device *dev = NULL;
   freenect_frame_mode mode;
-  int frames = 0;
-  (void)arg;
+  int frames = 0, waited = 0;
 
-  cube_cloud_init(&cloud);
-  front = (uint8_t *)calloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3, 1);
-  back = (uint8_t *)calloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3, 1);
-  depth_keep = (uint16_t *)calloc(DEP_N, sizeof(uint16_t));
-  if (!front || !back || !depth_keep) {
-    set_err("oom");
-    goto done;
-  }
-
-  /* Last file first so the preview is never blank. */
-  if (cube_cloud_load_xyz(&cloud, CUBE_KINECT_XYZ, CUBE_CLOUD_MAX) == 0)
-    paint(&cloud, elev, azim, dist);
-
-  kinect_motor_close();
-  cube_cloud_free_holders();
-  usleep(250000);
-
-  if (freenect_init(&ctx, NULL) < 0) {
-    set_err("freenect_init failed");
-    goto done;
-  }
-  freenect_set_log_level(ctx, FREENECT_LOG_WARNING);
+  if (freenect_init(&ctx, NULL) < 0) return -1;
+  freenect_set_log_level(ctx, FREENECT_LOG_FATAL);
   freenect_select_subdevices(ctx, (freenect_device_flags)(FREENECT_DEVICE_MOTOR | FREENECT_DEVICE_CAMERA));
   if (freenect_num_devices(ctx) < 1 || freenect_open_device(ctx, &dev, 0) < 0) {
-    set_err("open Kinect camera+motor failed");
-    goto done;
+    freenect_shutdown(ctx);
+    return -1;
   }
   mode = freenect_find_depth_mode(FREENECT_RESOLUTION_MEDIUM, FREENECT_DEPTH_11BIT);
-  if (!mode.is_valid || freenect_set_depth_mode(dev, mode) < 0) {
-    set_err("depth mode 11-bit failed");
-    goto done;
+  if (!mode.is_valid || freenect_set_depth_mode(dev, mode) < 0 ||
+      freenect_start_depth(dev) < 0) {
+    freenect_close_device(dev);
+    freenect_shutdown(ctx);
+    return -1;
   }
   freenect_set_depth_callback(dev, depth_cb);
-  if (freenect_start_depth(dev) < 0) {
-    set_err("start_depth failed");
-    goto done;
-  }
   freenect_set_led(dev, LED_YELLOW);
   live_dev = dev;
 
@@ -149,31 +216,58 @@ static void *cloud_main(void *arg) {
     fresh = depth_new;
     depth_new = 0;
     pthread_mutex_unlock(&depth_mu);
-    if (!fresh) continue;
-
-    if (cube_cloud_from_depth(&cloud, depth_keep, 3) == 0 && cloud.n > 0) {
-      paint(&cloud, e, a, d);
-      if ((++frames % 8) == 0) cube_cloud_publish(&cloud);
+    if (!fresh) {
+      if (!live_frames && ++waited > 80) break; /* ~2.4s no frames → dump */
+      continue;
+    }
+    waited = 0;
+    if (cube_cloud_from_depth(cloud, depth_keep, 3) == 0 && cloud->n > 0) {
+      paint(cloud, e, a, d);
+      pthread_mutex_lock(&mu);
+      live_frames++;
+      err[0] = 0;
+      pthread_mutex_unlock(&mu);
+      if ((++frames % 8) == 0) cube_cloud_publish(cloud);
     }
   }
 
   live_dev = NULL;
-  if (dev) {
-    freenect_stop_depth(dev);
-    freenect_set_led(dev, LED_OFF);
-    freenect_close_device(dev);
-    dev = NULL;
+  freenect_stop_depth(dev);
+  freenect_set_led(dev, LED_OFF);
+  freenect_close_device(dev);
+  freenect_shutdown(ctx);
+  return live_frames > 0 ? 0 : -1;
+}
+
+static void *cloud_main(void *arg) {
+  cube_cloud cloud;
+  (void)arg;
+  cube_cloud_init(&cloud);
+  front = (uint8_t *)calloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3, 1);
+  back = (uint8_t *)calloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3, 1);
+  depth_keep = (uint16_t *)calloc(DEP_N, sizeof(uint16_t));
+  if (!front || !back || !depth_keep) {
+    set_err("oom");
+    goto done;
   }
+
+  /* Exclusive USB: inhibit motor reopen, then close the boot handle. */
+  kinect_motor_inhibit(1);
+  kinect_motor_close();
+  cube_cloud_free_holders();
+  usleep(300000);
+
+  if (loop_live(&cloud) < 0 && !stop_flag) {
+    /* Honest fallback: exclusive dump child, parent holds no libusb. */
+    set_err("live open failed — dump");
+    loop_dump(&cloud);
+  }
+
 done:
-  if (ctx) {
-    freenect_shutdown(ctx);
-    ctx = NULL;
-  }
   cube_cloud_free(&cloud);
   pthread_mutex_lock(&mu);
   running = 0;
   pthread_mutex_unlock(&mu);
-  /* Keep last preview buffers until stop() so GTK never sees a freed frame. */
   return NULL;
 }
 
@@ -182,30 +276,37 @@ int kinect_cloud_start(void) {
   pthread_mutex_lock(&mu);
   err[0] = 0;
   npoints = 0;
+  live_frames = 0;
   stop_flag = 0;
   pthread_mutex_unlock(&mu);
 
+  kinect_motor_inhibit(1);
+  kinect_motor_close();
+
   if (pthread_create(&th, NULL, cloud_main, NULL) != 0) {
+    kinect_motor_inhibit(0);
     set_err("cloud thread");
     return -1;
   }
   started = 1;
   {
     int i;
-    for (i = 0; i < 160; i++) {
-      int run;
+    for (i = 0; i < 200; i++) {
+      int run, lf;
       char e0[160];
       pthread_mutex_lock(&mu);
       run = running;
+      lf = live_frames;
       snprintf(e0, sizeof e0, "%s", err);
       pthread_mutex_unlock(&mu);
-      if (run) return 0;
-      if (e0[0] && i > 8) return -1;
+      if (lf > 0) return 0;
+      if (run && i > 12) return 0; /* thread owns USB; UI waits for live */
+      if (e0[0] && !run && i > 16) return -1;
       usleep(25000);
     }
   }
-  if (kinect_cloud_running()) return 0;
-  if (!err[0]) set_err("cloud did not start");
+  if (kinect_cloud_running() || live_frames > 0) return 0;
+  if (!err[0]) set_err("no live depth");
   return -1;
 }
 
@@ -224,6 +325,7 @@ void kinect_cloud_stop(void) {
   pthread_mutex_unlock(&mu);
   free(depth_keep);
   depth_keep = NULL;
+  kinect_motor_inhibit(0);
   kinect_motor_open();
 }
 
@@ -233,6 +335,14 @@ int kinect_cloud_running(void) {
   r = running;
   pthread_mutex_unlock(&mu);
   return r;
+}
+
+int kinect_cloud_live(void) {
+  int n;
+  pthread_mutex_lock(&mu);
+  n = live_frames;
+  pthread_mutex_unlock(&mu);
+  return n;
 }
 
 const char *kinect_cloud_error(void) { return err; }

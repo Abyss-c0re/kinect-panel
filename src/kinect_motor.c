@@ -10,9 +10,14 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static freenect_context *ctx;
 static freenect_device *dev;
 static int opened;
+static int inhibited;
+
+void kinect_motor_inhibit(int on) { inhibited = on ? 1 : 0; }
+int kinect_motor_inhibited(void) { return inhibited; }
 
 int kinect_motor_open(void) {
   int n;
+  if (inhibited) return -1;
   pthread_mutex_lock(&mu);
   if (opened) {
     pthread_mutex_unlock(&mu);
@@ -64,6 +69,7 @@ static void pump_n(int n, int usec) {
 
 int kinect_motor_set_tilt(double degrees) {
   int r;
+  if (inhibited) return -1;
   if (degrees < -30) degrees = -30;
   if (degrees > 30) degrees = 30;
   if (kinect_motor_open() < 0) return -1;
@@ -76,6 +82,7 @@ int kinect_motor_set_tilt(double degrees) {
 
 int kinect_motor_get_tilt(double *degrees, int *status) {
   freenect_raw_tilt_state *st;
+  if (inhibited) return -1;
   if (kinect_motor_open() < 0) return -1;
   pthread_mutex_lock(&mu);
   pump_n(1, 30000);
@@ -93,6 +100,7 @@ int kinect_motor_get_tilt(double *degrees, int *status) {
 
 int kinect_motor_set_led(int led) {
   int r;
+  if (inhibited) return 0;
   if (kinect_motor_open() < 0) return -1;
   pthread_mutex_lock(&mu);
   r = freenect_set_led(dev, (freenect_led_options)led);

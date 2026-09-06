@@ -7,7 +7,7 @@ FRENECT := -I/usr/include/libfreenect -I/usr/include/libusb-1.0 -lfreenect -lm -
 
 .PHONY: all clean install
 
-all: bin/kinect_panel
+all: bin/kinect_panel bin/kinect_depth_dump
 
 bin/kinect_panel: src/kinect_panel.c src/kinect_v4l.c src/kinect_motor.c src/kinect_bridge.c \
                   src/kinect_ir.c src/kinect_cloud_view.c src/cube_kinect_cloud.c \
@@ -18,12 +18,18 @@ bin/kinect_panel: src/kinect_panel.c src/kinect_v4l.c src/kinect_motor.c src/kin
 	  src/kinect_bridge.c src/kinect_ir.c src/kinect_cloud_view.c src/cube_kinect_cloud.c \
 	  $(GTK) $(FRENECT)
 
+bin/kinect_depth_dump: src/kinect_depth_dump.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ src/kinect_depth_dump.c \
+	  -I/usr/include/libfreenect -lfreenect_sync -lfreenect -lm
+
 install: all
 	install -d $(PREFIX)/bin
 	install -m 0755 bin/kinect_panel $(PREFIX)/bin/kinect-panel
+	install -m 0755 bin/kinect_depth_dump $(PREFIX)/bin/kinect_depth_dump
 
 clean:
-	rm -f bin/kinect_panel
+	rm -f bin/kinect_panel bin/kinect_depth_dump
 
 clean:
 	rm -f bin/kinect_panel

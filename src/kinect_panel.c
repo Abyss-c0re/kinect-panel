@@ -196,7 +196,9 @@ static gboolean on_bridge_ok(gpointer data) {
   bridge_starting = 0;
   refresh_dev();
   if (is_cloud())
-    snprintf(buf, sizeof buf, "Cloud LIVE · n=%d · drag the preview to orbit",
+    snprintf(buf, sizeof buf,
+             kinect_cloud_live() ? "Cloud LIVE · n=%d · drag preview to orbit"
+                                 : "Cloud · waiting for live depth…",
              kinect_cloud_points());
   else
     snprintf(buf, sizeof buf, "Webcam LIVE · %s · “Kinect Webcam” (%s)", mode,
@@ -453,9 +455,10 @@ static gboolean poll_tilt(gpointer u) {
   char buf[96];
   (void)u;
   if (closing) return FALSE;
-  if (is_cloud() && kinect_cloud_running()) {
+  if (is_cloud()) {
+    /* Never reopen motor-only freenect while Cloud owns USB. */
     if (kinect_cloud_get_tilt(&deg, &st) != 0) {
-      gtk_label_set_text(GTK_LABEL(tilt_lbl), "Tilt: cloud…");
+      gtk_label_set_text(GTK_LABEL(tilt_lbl), "Tilt: cloud");
       return TRUE;
     }
   } else {
@@ -485,7 +488,13 @@ static gboolean preview_tick(gpointer u) {
     if (rgb && kinect_cloud_preview_rgb(rgb) == 0)
       show_rgb(rgb, KINECT_RGB_W, KINECT_RGB_H);
     free(rgb);
-    if (kinect_cloud_running()) refresh_dev();
+    if (kinect_cloud_live()) {
+      char buf[192];
+      snprintf(buf, sizeof buf, "Cloud LIVE · n=%d · drag preview to orbit",
+               kinect_cloud_points());
+      set_status(buf);
+    }
+    if (kinect_cloud_running() || kinect_cloud_live()) refresh_dev();
     return TRUE;
   }
   if (preview_on && !bridge_starting) snap_async();

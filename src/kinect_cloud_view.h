@@ -10,6 +10,7 @@ extern "C" {
 int kinect_cloud_start(void);
 void kinect_cloud_stop(void);
 int kinect_cloud_running(void);
+int kinect_cloud_live(void); /* live depth frames seen (not a stale file) */
 const char *kinect_cloud_error(void);
 int kinect_cloud_preview_rgb(uint8_t *rgb /* 640*480*3 */);
 int kinect_cloud_points(void);
