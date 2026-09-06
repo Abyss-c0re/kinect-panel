@@ -24,6 +24,7 @@ int kinect_grab_ir_grey(const char *dev, uint8_t *grey /* 640*488 */);
 void kinect_grey_to_rgb(const uint8_t *grey, int w, int h, uint8_t *rgb);
 void kinect_uyvy_to_yuyv(const uint8_t *uyvy, uint8_t *yuyv, int npix);
 void kinect_grey_to_yuyv(const uint8_t *grey, int w, int h, uint8_t *yuyv /* 640*480*2 */);
+void kinect_rgb_to_yuyv(const uint8_t *rgb, uint8_t *yuyv);
 int kinect_vcam_open(const char *dev);
 int kinect_vcam_write_yuyv(int fd, const uint8_t *yuyv);
 

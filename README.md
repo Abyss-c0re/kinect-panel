@@ -2,7 +2,7 @@
 
 C + GTK3 control panel for an Xbox 360 Kinect: RGB / IR webcam, IR vision grade, tilt, and a live depth point cloud in the same preview.
 
-**v0.2.0** — no Python on the run path.
+**v0.3.0** — C + GTK3, ROCm frame gen (no Python on the run path).
 
 ## Build
 
@@ -27,6 +27,18 @@ make install   # ~/.local/bin/kinect-panel
 ```
 
 Do not stream RGB/IR and Cloud at the same time — they share the USB camera.
+
+## Frame gen (ROCm)
+
+`src/fg/` — HIP motion-compensated interpolation on the Radeon (`gfx1201`).  
+**In-memory only:** two live frames + generated mids. No disk, no telemetry.
+
+Image tab → **Frame gen (ROCm)** → Boost `0` (off) … `3` (4×). Applies to RGB, IR, and Cloud.
+
+```bash
+make
+./bin/fg_probe    # {"backend":"hip", ... "collect":false}
+```
 
 ## Layout
 

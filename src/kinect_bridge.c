@@ -3,6 +3,7 @@
 #include "kinect_bridge.h"
 #include "kinect_ir.h"
 #include "kinect_v4l.h"
+#include "fg/fg.h"
 
 #include <linux/videodev2.h>
 #include <pthread.h>
@@ -27,6 +28,8 @@ static char err[160];
 static uint8_t preview[KINECT_RGB_W * KINECT_RGB_H * 3];
 static int have_preview;
 static kinect_ir_tune ir_tune;
+static fg_engine *fg;
+static int fg_boost;
 
 static void set_err(const char *s) {
   pthread_mutex_lock(&mu);
@@ -44,16 +47,19 @@ static void *bridge_main(void *arg) {
                       : ((size_t)KINECT_RGB_W * KINECT_RGB_H * 2);
   (void)arg;
 
+  uint8_t *fgbuf = NULL;
   raw = (uint8_t *)malloc(raw_len + 32);
   yuyv = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 2);
+  fgbuf = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
   if (ir) {
     grey = (uint8_t *)malloc((size_t)KINECT_IR_W * KINECT_IR_H);
     ir10 = (uint16_t *)malloc((size_t)KINECT_IR_W * KINECT_IR_H * sizeof(uint16_t));
   }
-  if (!raw || !yuyv || (ir && (!grey || !ir10))) {
+  if (!raw || !yuyv || !fgbuf || (ir && (!grey || !ir10))) {
     set_err("oom");
     goto out;
   }
+  if (!fg) fg = fg_create();
 
   if (ir) {
     if (kinect_cap_open(&cap, source, V4L2_PIX_FMT_Y10BPACK, KINECT_IR_W, KINECT_IR_H) < 0) {
@@ -131,14 +137,29 @@ static void *bridge_main(void *arg) {
         }
       }
     }
-    if (kinect_vcam_write_yuyv(vfd, yuyv) < 0) {
-      /* exclusive_caps can stall one write; retry */
-      usleep(5000);
+    {
+      int nout, fi, mid;
+      pthread_mutex_lock(&mu);
+      mid = fg_boost;
+      pthread_mutex_unlock(&mu);
+      if (fg) {
+        fg_set_boost(fg, mid);
+        nout = fg_push_rgb(fg, rgb);
+      } else {
+        nout = 1;
+      }
+      for (fi = 0; fi < nout; fi++) {
+        uint8_t *fr = rgb;
+        if (fg && fg_copy(fg, fi, fgbuf) == 0) fr = fgbuf;
+        kinect_rgb_to_yuyv(fr, yuyv);
+        if (kinect_vcam_write_yuyv(vfd, yuyv) < 0) usleep(4000);
+        pthread_mutex_lock(&mu);
+        memcpy(preview, fr, sizeof preview);
+        have_preview = 1;
+        pthread_mutex_unlock(&mu);
+        if (fi + 1 < nout) usleep(8000);
+      }
     }
-    pthread_mutex_lock(&mu);
-    memcpy(preview, rgb, sizeof preview);
-    have_preview = 1;
-    pthread_mutex_unlock(&mu);
   }
 
   kinect_cap_close(&cap);
@@ -148,6 +169,7 @@ out:
   free(yuyv);
   free(grey);
   free(ir10);
+  free(fgbuf);
   pthread_mutex_lock(&mu);
   running = 0;
   pthread_mutex_unlock(&mu);
@@ -206,6 +228,10 @@ void kinect_bridge_stop(void) {
   pthread_join(th, NULL);
   started = 0;
   running = 0;
+  if (fg) {
+    fg_destroy(fg);
+    fg = NULL;
+  }
 }
 
 int kinect_bridge_running(void) {
@@ -227,6 +253,25 @@ int kinect_bridge_preview_rgb(uint8_t *rgb) {
   if (ok) memcpy(rgb, preview, sizeof preview);
   pthread_mutex_unlock(&mu);
   return ok ? 0 : -1;
+}
+
+void kinect_bridge_set_fg_boost(int mid_frames) {
+  pthread_mutex_lock(&mu);
+  fg_boost = mid_frames;
+  pthread_mutex_unlock(&mu);
+  if (fg) fg_set_boost(fg, mid_frames);
+}
+
+int kinect_bridge_get_fg_boost(void) {
+  int b;
+  pthread_mutex_lock(&mu);
+  b = fg_boost;
+  pthread_mutex_unlock(&mu);
+  return b;
+}
+
+const char *kinect_bridge_fg_backend(void) {
+  return fg ? fg_backend(fg) : "off";
 }
 
 void kinect_bridge_set_ir_tune(const kinect_ir_tune *t) {

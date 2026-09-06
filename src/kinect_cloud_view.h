@@ -22,6 +22,9 @@ int kinect_cloud_get_tilt(double *degrees, int *status);
 void kinect_cloud_set_tune(const cube_cloud_tune *t);
 void kinect_cloud_get_tune(cube_cloud_tune *t);
 void kinect_cloud_reset_view(void);
+void kinect_cloud_set_fg_boost(int mid_frames);
+int kinect_cloud_get_fg_boost(void);
+const char *kinect_cloud_fg_backend(void);
 
 #ifdef __cplusplus
 }

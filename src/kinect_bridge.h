@@ -16,6 +16,9 @@ const char *kinect_bridge_vcam(void);
 int kinect_bridge_preview_rgb(uint8_t *rgb /* 640*480*3 */);
 void kinect_bridge_set_ir_tune(const kinect_ir_tune *t);
 void kinect_bridge_get_ir_tune(kinect_ir_tune *t);
+void kinect_bridge_set_fg_boost(int mid_frames);
+int kinect_bridge_get_fg_boost(void);
+const char *kinect_bridge_fg_backend(void);
 
 #ifdef __cplusplus
 }

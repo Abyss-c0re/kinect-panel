@@ -28,6 +28,7 @@ static GtkWidget *btn_cam, *btn_preview, *tilt_scale, *tilt_lbl, *keep_above;
 static GtkWidget *ir_frame, *cloud_frame, *tabs;
 static GtkWidget *sc_boost, *sc_bright, *sc_contrast, *sc_gamma, *sc_black, *sc_white;
 static GtkWidget *sc_near, *sc_far, *sc_stride, *sc_dot, *combo_color;
+static GtkWidget *sc_fg, *lbl_fg;
 static int camera_on, preview_on, closing, snap_busy, bridge_starting;
 static int sock_fd = -1;
 static char sock_path[256];
@@ -406,6 +407,23 @@ static void on_cloud_room(GtkButton *b, gpointer u) {
   set_status("Cloud Room — 0.5–3.5 m");
 }
 
+static void on_fg_boost(GtkRange *r, gpointer u) {
+  int m;
+  char buf[96];
+  const char *be;
+  (void)u;
+  if (ir_ui_guard) return;
+  m = (int)gtk_range_get_value(r);
+  kinect_bridge_set_fg_boost(m);
+  kinect_cloud_set_fg_boost(m);
+  be = is_cloud() ? kinect_cloud_fg_backend() : kinect_bridge_fg_backend();
+  if (lbl_fg) {
+    snprintf(buf, sizeof buf, "FG %s · %dx (in-memory, no save)", be,
+             m + 1);
+    gtk_label_set_text(GTK_LABEL(lbl_fg), buf);
+  }
+}
+
 static void on_cloud_reset_view(GtkButton *b, gpointer u) {
   (void)b;
   (void)u;
@@ -689,6 +707,8 @@ static gboolean boot(gpointer u) {
   cube_cloud_tune_default(&ct);
   sliders_from_cloud(&ct);
   kinect_cloud_set_tune(&ct);
+  kinect_bridge_set_fg_boost(1);
+  kinect_cloud_set_fg_boost(1);
   if (kinect_motor_open() == 0 && kinect_motor_get_tilt(&deg, &st) == 0) {
     kinect_motor_set_led(LED_OFF);
     if (deg < TILT_MIN || deg > TILT_MAX) deg = 0;
@@ -860,6 +880,19 @@ int main(int argc, char **argv) {
   gtk_box_pack_start(GTK_BOX(cloud_box), row, FALSE, FALSE, 0);
   gtk_widget_set_sensitive(cloud_frame, FALSE);
   gtk_box_pack_start(GTK_BOX(page_img), cloud_frame, FALSE, FALSE, 0);
+
+  {
+    GtkWidget *fgf = gtk_frame_new("Frame gen (ROCm)");
+    GtkWidget *fgb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(fgb), 6);
+    gtk_container_add(GTK_CONTAINER(fgf), fgb);
+    sc_fg = mk_scale("Boost", 0, 3, 1, 1, fgb, G_CALLBACK(on_fg_boost));
+    lbl_fg = gtk_label_new("FG · off until Camera/Cloud");
+    gtk_label_set_xalign(GTK_LABEL(lbl_fg), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(lbl_fg), TRUE);
+    gtk_box_pack_start(GTK_BOX(fgb), lbl_fg, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page_img), fgf, FALSE, FALSE, 0);
+  }
 
   tip = gtk_label_new(
       "Image tab: IR grade or Cloud clip/density/color. Camera tab keeps tilt.\n"

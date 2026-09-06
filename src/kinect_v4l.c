@@ -435,6 +435,29 @@ void kinect_grey_to_yuyv(const uint8_t *grey, int w, int h, uint8_t *yuyv) {
   }
 }
 
+void kinect_rgb_to_yuyv(const uint8_t *rgb, uint8_t *yuyv) {
+  int x, y;
+  for (y = 0; y < KINECT_RGB_H; y++) {
+    for (x = 0; x < KINECT_RGB_W; x += 2) {
+      const uint8_t *p0 = rgb + (y * KINECT_RGB_W + x) * 3;
+      const uint8_t *p1 = p0 + 3;
+      int y0 = (77 * p0[0] + 150 * p0[1] + 29 * p0[2]) >> 8;
+      int y1 = (77 * p1[0] + 150 * p1[1] + 29 * p1[2]) >> 8;
+      int u = 128 + ((-43 * p0[0] - 85 * p0[1] + 128 * p0[2]) >> 8);
+      int v = 128 + ((128 * p0[0] - 107 * p0[1] - 21 * p0[2]) >> 8);
+      int o = (y * KINECT_RGB_W + x) * 2;
+      if (u < 0) u = 0;
+      if (u > 255) u = 255;
+      if (v < 0) v = 0;
+      if (v > 255) v = 255;
+      yuyv[o + 0] = (uint8_t)y0;
+      yuyv[o + 1] = (uint8_t)u;
+      yuyv[o + 2] = (uint8_t)y1;
+      yuyv[o + 3] = (uint8_t)v;
+    }
+  }
+}
+
 int kinect_vcam_open(const char *dev) {
   int fd;
   struct v4l2_format fmt;

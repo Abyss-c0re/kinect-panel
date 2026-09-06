@@ -6,6 +6,7 @@
 #include "cube_paths.h"
 #include "kinect_motor.h"
 #include "kinect_v4l.h"
+#include "fg/fg.h"
 
 #include <fcntl.h>
 #include <libfreenect.h>
@@ -36,6 +37,8 @@ static double last_tilt, pending_tilt;
 static int last_tilt_st, have_pending_tilt;
 static cube_cloud_tune tune;
 static int tune_inited, tune_dirty;
+static fg_engine *fg;
+static int fg_boost;
 
 static uint16_t *depth_keep;
 static int depth_new;
@@ -70,6 +73,29 @@ static void paint(cube_cloud *cloud, float e, float a, float d) {
   have_preview = 1;
   npoints = cloud->n;
   pthread_mutex_unlock(&mu);
+}
+
+static void emit_fg(void) {
+  int n, i, mid;
+  uint8_t *tmp;
+  if (!fg || !front) return;
+  pthread_mutex_lock(&mu);
+  mid = fg_boost;
+  pthread_mutex_unlock(&mu);
+  if (mid < 1) return;
+  fg_set_boost(fg, mid);
+  n = fg_push_rgb(fg, front);
+  if (n < 2) return;
+  tmp = (uint8_t *)malloc(FG_RGB);
+  if (!tmp) return;
+  for (i = 0; i < n; i++) {
+    if (fg_copy(fg, i, tmp) != 0) continue;
+    pthread_mutex_lock(&mu);
+    if (front) memcpy(front, tmp, FG_RGB);
+    pthread_mutex_unlock(&mu);
+    if (i + 1 < n) usleep(8000);
+  }
+  free(tmp);
 }
 
 static int find_dump(char *out, size_t n) {
@@ -160,6 +186,7 @@ static int loop_dump(cube_cloud *cloud) {
         cloud->n > 0) {
       for (i = 0; i < cloud->n; i++) cube_cloud_color_point(&cloud->pt[i], &tcopy);
       paint(cloud, e, a, d);
+      emit_fg();
       pthread_mutex_lock(&mu);
       live_frames++;
       err[0] = 0;
@@ -254,6 +281,7 @@ static int loop_live(cube_cloud *cloud) {
         live_frames++;
         err[0] = 0;
         pthread_mutex_unlock(&mu);
+        emit_fg();
         if ((++frames % 8) == 0) cube_cloud_publish(cloud);
       }
     }
@@ -278,6 +306,7 @@ static void *cloud_main(void *arg) {
     set_err("oom");
     goto done;
   }
+  if (!fg) fg = fg_create();
 
   /* Exclusive USB: inhibit motor reopen, then close the boot handle. */
   kinect_motor_inhibit(1);
@@ -353,6 +382,10 @@ void kinect_cloud_stop(void) {
   pthread_mutex_unlock(&mu);
   free(depth_keep);
   depth_keep = NULL;
+  if (fg) {
+    fg_destroy(fg);
+    fg = NULL;
+  }
   kinect_motor_inhibit(0);
   kinect_motor_open();
 }
@@ -453,6 +486,23 @@ void kinect_cloud_get_tune(cube_cloud_tune *t) {
   *t = tune;
   pthread_mutex_unlock(&mu);
 }
+
+void kinect_cloud_set_fg_boost(int mid_frames) {
+  pthread_mutex_lock(&mu);
+  fg_boost = mid_frames;
+  pthread_mutex_unlock(&mu);
+  if (fg) fg_set_boost(fg, mid_frames);
+}
+
+int kinect_cloud_get_fg_boost(void) {
+  int b;
+  pthread_mutex_lock(&mu);
+  b = fg_boost;
+  pthread_mutex_unlock(&mu);
+  return b;
+}
+
+const char *kinect_cloud_fg_backend(void) { return fg ? fg_backend(fg) : "off"; }
 
 void kinect_cloud_reset_view(void) {
   pthread_mutex_lock(&mu);
