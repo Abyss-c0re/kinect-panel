@@ -1,6 +1,7 @@
 #ifndef KINECT_CLOUD_VIEW_H
 #define KINECT_CLOUD_VIEW_H
 
+#include "cube_kinect_cloud.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -18,6 +19,9 @@ void kinect_cloud_orbit(float elev, float azim, float dist);
 void kinect_cloud_get_orbit(float *elev, float *azim, float *dist);
 int kinect_cloud_set_tilt(double degrees);
 int kinect_cloud_get_tilt(double *degrees, int *status);
+void kinect_cloud_set_tune(const cube_cloud_tune *t);
+void kinect_cloud_get_tune(cube_cloud_tune *t);
+void kinect_cloud_reset_view(void);
 
 #ifdef __cplusplus
 }

@@ -32,8 +32,20 @@ void cube_cloud_free(cube_cloud *c);
 /* Stop cube_daemon / freenect viewers that hold the camera. */
 void cube_cloud_free_holders(void);
 
+typedef struct cube_cloud_tune {
+  int stride;    /* 2..8 pixel step */
+  float z_near;  /* metres */
+  float z_far;
+  int color;     /* 0=depth crimson 1=height 2=grey */
+  int dot;       /* 1..4 splat radius */
+} cube_cloud_tune;
+
+void cube_cloud_tune_default(cube_cloud_tune *t);
+void cube_cloud_color_point(cube_cloud_pt *p, const cube_cloud_tune *t);
+
 /* Project a 640×480 FREENECT_DEPTH_11BIT buffer. */
 int cube_cloud_from_depth(cube_cloud *c, const uint16_t *depth, int stride);
+int cube_cloud_from_depth_ex(cube_cloud *c, const uint16_t *depth, const cube_cloud_tune *t);
 
 /* One depth frame via libfreenect_sync. Does not stop the device. */
 int cube_cloud_capture(cube_cloud *c, int stride);
@@ -51,6 +63,8 @@ int cube_cloud_write_ppm(const cube_cloud *c, const char *path, int w, int h,
 /* Same orbit into packed RGB (w*h*3). */
 int cube_cloud_render_rgb(const cube_cloud *c, uint8_t *rgb, int w, int h,
                           float elev_deg, float azim_deg, float dist);
+int cube_cloud_render_rgb_ex(const cube_cloud *c, uint8_t *rgb, int w, int h,
+                             float elev_deg, float azim_deg, float dist, int dot);
 
 #ifdef __cplusplus
 }

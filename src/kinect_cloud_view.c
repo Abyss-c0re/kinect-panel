@@ -34,6 +34,8 @@ static int have_preview, npoints;
 static float elev = 18.f, azim = -60.f, dist = 3.2f;
 static double last_tilt, pending_tilt;
 static int last_tilt_st, have_pending_tilt;
+static cube_cloud_tune tune;
+static int tune_inited, tune_dirty;
 
 static uint16_t *depth_keep;
 static int depth_new;
@@ -59,7 +61,7 @@ static void depth_cb(freenect_device *dev, void *depth, uint32_t ts) {
 static void paint(cube_cloud *cloud, float e, float a, float d) {
   uint8_t *tmp;
   if (!back) return;
-  if (cube_cloud_render_rgb(cloud, back, KINECT_RGB_W, KINECT_RGB_H, e, a, d) < 0)
+  if (cube_cloud_render_rgb_ex(cloud, back, KINECT_RGB_W, KINECT_RGB_H, e, a, d, tune.dot) < 0)
     return;
   pthread_mutex_lock(&mu);
   tmp = front;
@@ -105,14 +107,17 @@ static int find_dump(char *out, size_t n) {
   return -1;
 }
 
-static int spawn_dump(const char *bin, const char *xyz) {
+static int spawn_dump(const char *bin, const char *xyz, int stride) {
   pid_t pid = 0;
   int st = 0;
+  char step[8];
   char *argv[5];
   posix_spawn_file_actions_t fa;
+  if (stride < 1) stride = 4;
+  snprintf(step, sizeof step, "%d", stride);
   argv[0] = (char *)bin;
   argv[1] = (char *)xyz;
-  argv[2] = "4";
+  argv[2] = step;
   argv[3] = NULL;
   if (posix_spawn_file_actions_init(&fa) != 0) return -1;
   posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
@@ -141,9 +146,19 @@ static int loop_dump(cube_cloud *cloud) {
     a = azim;
     d = dist;
     pthread_mutex_unlock(&mu);
-    if (spawn_dump(bin, CUBE_KINECT_XYZ) == 0 &&
+    cube_cloud_tune tcopy;
+    int i;
+    pthread_mutex_lock(&mu);
+    if (!tune_inited) {
+      cube_cloud_tune_default(&tune);
+      tune_inited = 1;
+    }
+    tcopy = tune;
+    pthread_mutex_unlock(&mu);
+    if (spawn_dump(bin, CUBE_KINECT_XYZ, tcopy.stride) == 0 &&
         cube_cloud_load_xyz(cloud, CUBE_KINECT_XYZ, CUBE_CLOUD_MAX) == 0 &&
         cloud->n > 0) {
+      for (i = 0; i < cloud->n; i++) cube_cloud_color_point(&cloud->pt[i], &tcopy);
       paint(cloud, e, a, d);
       pthread_mutex_lock(&mu);
       live_frames++;
@@ -216,18 +231,31 @@ static int loop_live(cube_cloud *cloud) {
     fresh = depth_new;
     depth_new = 0;
     pthread_mutex_unlock(&depth_mu);
-    if (!fresh) {
-      if (!live_frames && ++waited > 80) break; /* ~2.4s no frames → dump */
-      continue;
-    }
-    waited = 0;
-    if (cube_cloud_from_depth(cloud, depth_keep, 3) == 0 && cloud->n > 0) {
-      paint(cloud, e, a, d);
+    {
+      cube_cloud_tune tcopy;
+      int dirty;
       pthread_mutex_lock(&mu);
-      live_frames++;
-      err[0] = 0;
+      if (!tune_inited) {
+        cube_cloud_tune_default(&tune);
+        tune_inited = 1;
+      }
+      tcopy = tune;
+      dirty = tune_dirty;
+      tune_dirty = 0;
       pthread_mutex_unlock(&mu);
-      if ((++frames % 8) == 0) cube_cloud_publish(cloud);
+      if (!fresh && !dirty) {
+        if (!live_frames && ++waited > 80) break; /* ~2.4s no frames → dump */
+        continue;
+      }
+      waited = 0;
+      if (cube_cloud_from_depth_ex(cloud, depth_keep, &tcopy) == 0 && cloud->n > 0) {
+        paint(cloud, e, a, d);
+        pthread_mutex_lock(&mu);
+        live_frames++;
+        err[0] = 0;
+        pthread_mutex_unlock(&mu);
+        if ((++frames % 8) == 0) cube_cloud_publish(cloud);
+      }
     }
   }
 
@@ -397,4 +425,40 @@ int kinect_cloud_get_tilt(double *degrees, int *status) {
   if (status) *status = last_tilt_st;
   pthread_mutex_unlock(&mu);
   return 0;
+}
+
+void kinect_cloud_set_tune(const cube_cloud_tune *t) {
+  if (!t) return;
+  pthread_mutex_lock(&mu);
+  tune = *t;
+  if (tune.stride < 1) tune.stride = 1;
+  if (tune.stride > 8) tune.stride = 8;
+  if (tune.z_near < 0.3f) tune.z_near = 0.3f;
+  if (tune.z_far < tune.z_near + 0.15f) tune.z_far = tune.z_near + 0.15f;
+  if (tune.dot < 1) tune.dot = 1;
+  if (tune.dot > 4) tune.dot = 4;
+  if (tune.color < 0 || tune.color > 2) tune.color = 0;
+  tune_inited = 1;
+  tune_dirty = 1;
+  pthread_mutex_unlock(&mu);
+}
+
+void kinect_cloud_get_tune(cube_cloud_tune *t) {
+  if (!t) return;
+  pthread_mutex_lock(&mu);
+  if (!tune_inited) {
+    cube_cloud_tune_default(&tune);
+    tune_inited = 1;
+  }
+  *t = tune;
+  pthread_mutex_unlock(&mu);
+}
+
+void kinect_cloud_reset_view(void) {
+  pthread_mutex_lock(&mu);
+  elev = 18.f;
+  azim = -60.f;
+  dist = 3.2f;
+  tune_dirty = 1;
+  pthread_mutex_unlock(&mu);
 }

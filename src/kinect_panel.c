@@ -25,8 +25,9 @@
 
 static GtkWidget *win, *status_lbl, *dev_lbl, *preview_img, *preview_ev;
 static GtkWidget *btn_cam, *btn_preview, *tilt_scale, *tilt_lbl, *keep_above;
-static GtkWidget *ir_frame, *tabs;
+static GtkWidget *ir_frame, *cloud_frame, *tabs;
 static GtkWidget *sc_boost, *sc_bright, *sc_contrast, *sc_gamma, *sc_black, *sc_white;
+static GtkWidget *sc_near, *sc_far, *sc_stride, *sc_dot, *combo_color;
 static int camera_on, preview_on, closing, snap_busy, bridge_starting;
 static int sock_fd = -1;
 static char sock_path[256];
@@ -291,6 +292,7 @@ static void on_mode(GtkToggleButton *b, gpointer u) {
   if (!gtk_toggle_button_get_active(b)) return;
   snprintf(mode, sizeof mode, "%s", m);
   if (ir_frame) gtk_widget_set_sensitive(ir_frame, is_ir());
+  if (cloud_frame) gtk_widget_set_sensitive(cloud_frame, is_cloud());
   /* Stay on Camera — Image tab is opt-in so tilt never disappears. */
   if (is_cloud()) {
     /* Python viewer started on launch — do not wait for Camera ON. */
@@ -338,6 +340,80 @@ static void on_see(GtkButton *b, gpointer u) {
   kinect_bridge_set_ir_tune(&ir_tune);
   set_status("IR SEE grade — percentile stretch + boost (the B/W that can see)");
   if (preview_on) snap_async();
+}
+
+static void apply_cloud_tune(void) {
+  cube_cloud_tune t;
+  if (!sc_near) return;
+  kinect_cloud_get_tune(&t);
+  t.z_near = (float)gtk_range_get_value(GTK_RANGE(sc_near));
+  t.z_far = (float)gtk_range_get_value(GTK_RANGE(sc_far));
+  t.stride = (int)gtk_range_get_value(GTK_RANGE(sc_stride));
+  t.dot = (int)gtk_range_get_value(GTK_RANGE(sc_dot));
+  if (combo_color)
+    t.color = gtk_combo_box_get_active(GTK_COMBO_BOX(combo_color));
+  if (t.z_far < t.z_near + 0.2f) t.z_far = t.z_near + 0.2f;
+  kinect_cloud_set_tune(&t);
+}
+
+static void sliders_from_cloud(const cube_cloud_tune *t) {
+  if (!sc_near || !t) return;
+  ir_ui_guard = 1;
+  gtk_range_set_value(GTK_RANGE(sc_near), t->z_near);
+  gtk_range_set_value(GTK_RANGE(sc_far), t->z_far);
+  gtk_range_set_value(GTK_RANGE(sc_stride), t->stride);
+  gtk_range_set_value(GTK_RANGE(sc_dot), t->dot);
+  if (combo_color) gtk_combo_box_set_active(GTK_COMBO_BOX(combo_color), t->color);
+  ir_ui_guard = 0;
+}
+
+static void on_cloud_slider(GtkRange *r, gpointer u) {
+  (void)r;
+  (void)u;
+  if (ir_ui_guard) return;
+  apply_cloud_tune();
+}
+
+static void on_cloud_color(GtkComboBox *c, gpointer u) {
+  (void)c;
+  (void)u;
+  if (ir_ui_guard) return;
+  apply_cloud_tune();
+}
+
+static void on_cloud_closeup(GtkButton *b, gpointer u) {
+  cube_cloud_tune t;
+  (void)b;
+  (void)u;
+  cube_cloud_tune_default(&t);
+  t.z_near = 0.45f;
+  t.z_far = 1.80f;
+  t.stride = 2;
+  t.dot = 3;
+  t.color = 0;
+  sliders_from_cloud(&t);
+  kinect_cloud_set_tune(&t);
+  set_status("Cloud Close-up — 0.45–1.8 m, dense");
+}
+
+static void on_cloud_room(GtkButton *b, gpointer u) {
+  cube_cloud_tune t;
+  (void)b;
+  (void)u;
+  cube_cloud_tune_default(&t);
+  sliders_from_cloud(&t);
+  kinect_cloud_set_tune(&t);
+  set_status("Cloud Room — 0.5–3.5 m");
+}
+
+static void on_cloud_reset_view(GtkButton *b, gpointer u) {
+  (void)b;
+  (void)u;
+  kinect_cloud_reset_view();
+  orbit_e = 18.f;
+  orbit_a = -60.f;
+  orbit_d = 3.2f;
+  set_status("Cloud view reset");
 }
 
 static void on_ir_reset(GtkButton *b, gpointer u) {
@@ -605,10 +681,14 @@ static void on_hide(GtkButton *b, gpointer u) {
 static gboolean boot(gpointer u) {
   double deg = 0;
   int st = 0;
+  cube_cloud_tune ct;
   (void)u;
   kinect_ir_tune_default(&ir_tune);
   sliders_from_tune(&ir_tune);
   kinect_bridge_set_ir_tune(&ir_tune);
+  cube_cloud_tune_default(&ct);
+  sliders_from_cloud(&ct);
+  kinect_cloud_set_tune(&ct);
   if (kinect_motor_open() == 0 && kinect_motor_get_tilt(&deg, &st) == 0) {
     kinect_motor_set_led(LED_OFF);
     if (deg < TILT_MIN || deg > TILT_MAX) deg = 0;
@@ -622,7 +702,7 @@ static gboolean boot(gpointer u) {
 }
 
 static GtkWidget *mk_scale(const char *name, double lo, double hi, double step, double val,
-                           GtkWidget *box) {
+                           GtkWidget *box, GCallback cb) {
   GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
   GtkWidget *lab = gtk_label_new(name);
   GtkWidget *sc = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, lo, hi, step);
@@ -632,7 +712,7 @@ static GtkWidget *mk_scale(const char *name, double lo, double hi, double step, 
   gtk_scale_set_draw_value(GTK_SCALE(sc), TRUE);
   gtk_scale_set_value_pos(GTK_SCALE(sc), GTK_POS_RIGHT);
   gtk_widget_set_hexpand(sc, TRUE);
-  g_signal_connect(sc, "value-changed", G_CALLBACK(on_ir_slider), NULL);
+  if (cb) g_signal_connect(sc, "value-changed", cb, NULL);
   gtk_box_pack_start(GTK_BOX(row), lab, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(row), sc, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
@@ -643,6 +723,7 @@ int main(int argc, char **argv) {
   GtkWidget *root, *frame, *box, *row, *cam_box, *tilt_f, *tilt, *foot, *ir_box;
   GtkWidget *btn_rgb, *btn_ir, *btn_cloud, *up, *dn, *lv, *hide, *snap, *tip;
   GtkWidget *see, *reset, *page_cam, *page_img, *scroll_img;
+  GtkWidget *cloud_box, *cup, *room, *rview;
 
   gtk_init(&argc, &argv);
   if (!acquire_instance()) {
@@ -726,12 +807,12 @@ int main(int argc, char **argv) {
   ir_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
   gtk_container_set_border_width(GTK_CONTAINER(ir_box), 6);
   gtk_container_add(GTK_CONTAINER(ir_frame), ir_box);
-  sc_boost = mk_scale("Boost", 0.5, 8.0, 0.1, 2.2, ir_box);
-  sc_bright = mk_scale("Bright", -80, 80, 1, 8, ir_box);
-  sc_contrast = mk_scale("Contrast", 0.4, 3.0, 0.05, 1.35, ir_box);
-  sc_gamma = mk_scale("Gamma", 0.35, 2.2, 0.05, 0.70, ir_box);
-  sc_black = mk_scale("Black %", 0, 25, 1, 4, ir_box);
-  sc_white = mk_scale("White %", 70, 100, 1, 96, ir_box);
+  sc_boost = mk_scale("Boost", 0.5, 8.0, 0.1, 2.2, ir_box, G_CALLBACK(on_ir_slider));
+  sc_bright = mk_scale("Bright", -80, 80, 1, 8, ir_box, G_CALLBACK(on_ir_slider));
+  sc_contrast = mk_scale("Contrast", 0.4, 3.0, 0.05, 1.35, ir_box, G_CALLBACK(on_ir_slider));
+  sc_gamma = mk_scale("Gamma", 0.35, 2.2, 0.05, 0.70, ir_box, G_CALLBACK(on_ir_slider));
+  sc_black = mk_scale("Black %", 0, 25, 1, 4, ir_box, G_CALLBACK(on_ir_slider));
+  sc_white = mk_scale("White %", 70, 100, 1, 96, ir_box, G_CALLBACK(on_ir_slider));
   row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   see = gtk_button_new_with_label("SEE (boost B/W)");
   reset = gtk_button_new_with_label("Reset grade");
@@ -743,9 +824,46 @@ int main(int argc, char **argv) {
   gtk_widget_set_sensitive(ir_frame, FALSE);
   gtk_box_pack_start(GTK_BOX(page_img), ir_frame, FALSE, FALSE, 0);
 
+  cloud_frame = gtk_frame_new("Cloud");
+  cloud_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+  gtk_container_set_border_width(GTK_CONTAINER(cloud_box), 6);
+  gtk_container_add(GTK_CONTAINER(cloud_frame), cloud_box);
+  sc_near = mk_scale("Near m", 0.35, 2.0, 0.05, 0.50, cloud_box, G_CALLBACK(on_cloud_slider));
+  sc_far = mk_scale("Far m", 1.0, 5.0, 0.05, 3.50, cloud_box, G_CALLBACK(on_cloud_slider));
+  sc_stride = mk_scale("Stride", 2, 8, 1, 3, cloud_box, G_CALLBACK(on_cloud_slider));
+  sc_dot = mk_scale("Dot", 1, 4, 1, 2, cloud_box, G_CALLBACK(on_cloud_slider));
+  {
+    GtkWidget *crow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *clab = gtk_label_new("Color");
+    combo_color = gtk_combo_box_text_new();
+    gtk_widget_set_size_request(clab, 72, -1);
+    gtk_label_set_xalign(GTK_LABEL(clab), 0);
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_color), "Depth");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_color), "Height");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_color), "Grey");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_color), 0);
+    g_signal_connect(combo_color, "changed", G_CALLBACK(on_cloud_color), NULL);
+    gtk_box_pack_start(GTK_BOX(crow), clab, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(crow), combo_color, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(cloud_box), crow, FALSE, FALSE, 0);
+  }
+  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  cup = gtk_button_new_with_label("Close-up");
+  room = gtk_button_new_with_label("Room");
+  rview = gtk_button_new_with_label("Reset view");
+  g_signal_connect(cup, "clicked", G_CALLBACK(on_cloud_closeup), NULL);
+  g_signal_connect(room, "clicked", G_CALLBACK(on_cloud_room), NULL);
+  g_signal_connect(rview, "clicked", G_CALLBACK(on_cloud_reset_view), NULL);
+  gtk_box_pack_start(GTK_BOX(row), cup, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(row), room, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(row), rview, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(cloud_box), row, FALSE, FALSE, 0);
+  gtk_widget_set_sensitive(cloud_frame, FALSE);
+  gtk_box_pack_start(GTK_BOX(page_img), cloud_frame, FALSE, FALSE, 0);
+
   tip = gtk_label_new(
-      "IR: sliders grade 10-bit (no hardware gain on gspca). SEE = the stretch that can see.\n"
-      "Cloud: drag preview to orbit, wheel zoom. Tilt stays on the Camera tab.");
+      "Image tab: IR grade or Cloud clip/density/color. Camera tab keeps tilt.\n"
+      "Cloud: Near/Far clip metres. Stride = sparser. Drag preview to orbit.");
   gtk_label_set_xalign(GTK_LABEL(tip), 0);
   gtk_label_set_line_wrap(GTK_LABEL(tip), TRUE);
   gtk_box_pack_start(GTK_BOX(page_img), tip, FALSE, FALSE, 0);

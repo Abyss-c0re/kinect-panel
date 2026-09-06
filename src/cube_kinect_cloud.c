@@ -125,13 +125,62 @@ void cube_cloud_free_holders(void) {
   usleep(300000);
 }
 
-int cube_cloud_from_depth(cube_cloud *c, const uint16_t *depth, int stride) {
+void cube_cloud_tune_default(cube_cloud_tune *t) {
+  if (!t) return;
+  t->stride = 3;
+  t->z_near = 0.50f;
+  t->z_far = 3.50f;
+  t->color = 0;
+  t->dot = 2;
+}
+
+void cube_cloud_color_point(cube_cloud_pt *p, const cube_cloud_tune *t) {
+  float tn, tf, u;
+  if (!p || !t) return;
+  tn = t->z_near;
+  tf = t->z_far;
+  if (tf <= tn + 0.05f) tf = tn + 0.05f;
+  if (t->color == 1) {
+    /* height: y up, seated/standing band */
+    u = (p->y + 0.4f) / 1.4f;
+  } else {
+    u = (p->z - tn) / (tf - tn);
+  }
+  if (u < 0) u = 0;
+  if (u > 1) u = 1;
+  if (t->color == 2) {
+    uint8_t g = (uint8_t)(40 + u * 200);
+    p->r = p->g = p->b = g;
+  } else if (t->color == 1) {
+    p->r = (uint8_t)(40 + u * 80);
+    p->g = (uint8_t)(180 - u * 80);
+    p->b = (uint8_t)(90 + (1.f - u) * 80);
+  } else {
+    p->r = 242;
+    p->g = (uint8_t)(38 + u * 90);
+    p->b = (uint8_t)(71 + (1.f - u) * 50);
+  }
+}
+
+int cube_cloud_from_depth_ex(cube_cloud *c, const uint16_t *depth, const cube_cloud_tune *t) {
   const int W = 640, H = 480;
   const float fx = 594.21f, fy = 591.04f, cx = 339.5f, cy = 242.7f;
-  int v, u, n = 0;
+  cube_cloud_tune def;
+  int stride, v, u, n = 0;
+  float zn, zf;
   if (!c || !depth) return -1;
+  if (!t) {
+    cube_cloud_tune_default(&def);
+    t = &def;
+  }
   cube_cloud_clear(c);
-  if (stride < 1) stride = 4;
+  stride = t->stride;
+  if (stride < 1) stride = 1;
+  if (stride > 10) stride = 10;
+  zn = t->z_near;
+  zf = t->z_far;
+  if (zn < 0.3f) zn = 0.3f;
+  if (zf < zn + 0.1f) zf = zn + 0.1f;
   if (cloud_reserve(c, (W / stride) * (H / stride) + 8) < 0) {
     snprintf(c->err, sizeof c->err, "oom");
     return -1;
@@ -139,27 +188,26 @@ int cube_cloud_from_depth(cube_cloud *c, const uint16_t *depth, int stride) {
   for (v = 0; v < H && n < c->cap; v += stride) {
     for (u = 0; u < W && n < c->cap; u += stride) {
       float z = raw_to_m(depth[v * W + u]);
-      float x, y, t;
       cube_cloud_pt *p;
-      if (z < 0.45f || z > 3.8f) continue;
-      x = (u - cx) * z / fx;
-      y = -((v - cy) * z / fy);
-      t = (z - 0.45f) / 3.35f;
-      if (t < 0) t = 0;
-      if (t > 1) t = 1;
+      if (z < zn || z > zf) continue;
       p = &c->pt[n++];
-      p->x = x;
-      p->y = y;
+      p->x = (u - cx) * z / fx;
+      p->y = -((v - cy) * z / fy);
       p->z = z;
-      p->r = 242;
-      p->g = (uint8_t)(38 + t * 90);
-      p->b = (uint8_t)(71 + (1.f - t) * 50);
+      cube_cloud_color_point(p, t);
     }
   }
   c->n = n;
   c->ok = n > 0;
   if (!c->ok) snprintf(c->err, sizeof c->err, "empty cloud");
   return c->ok ? 0 : -1;
+}
+
+int cube_cloud_from_depth(cube_cloud *c, const uint16_t *depth, int stride) {
+  cube_cloud_tune t;
+  cube_cloud_tune_default(&t);
+  t.stride = stride;
+  return cube_cloud_from_depth_ex(c, depth, &t);
 }
 
 int cube_cloud_capture(cube_cloud *c, int stride) {
@@ -237,11 +285,17 @@ int cube_cloud_publish(const cube_cloud *c) {
 
 int cube_cloud_render_rgb(const cube_cloud *c, uint8_t *rgb, int w, int h,
                           float elev_deg, float azim_deg, float dist) {
+  return cube_cloud_render_rgb_ex(c, rgb, w, h, elev_deg, azim_deg, dist, 2);
+}
+
+int cube_cloud_render_rgb_ex(const cube_cloud *c, uint8_t *rgb, int w, int h,
+                             float elev_deg, float azim_deg, float dist, int dot) {
   float *zbuf;
-  int i, x, y, npix;
+  int i, x, y, npix, rad;
   float elev, azim, se, ce, sa, ca;
   float cx = 0, cy = 0, cz = 0;
   if (!c || !rgb || w < 8 || h < 8) return -1;
+  rad = dot < 1 ? 1 : (dot > 4 ? 4 : dot);
   npix = w * h;
   memset(rgb, 0, (size_t)npix * 3);
   zbuf = (float *)malloc((size_t)npix * sizeof(float));
@@ -280,8 +334,8 @@ int cube_cloud_render_rgb(const cube_cloud *c, uint8_t *rgb, int w, int h,
     sy = vy * inv;
     ix = (int)((sx * 0.5f + 0.5f) * (float)w);
     iy = (int)((0.5f - sy * 0.5f) * (float)h);
-    for (dy = -1; dy <= 1; dy++) {
-      for (dx = -1; dx <= 1; dx++) {
+    for (dy = -rad; dy <= rad; dy++) {
+      for (dx = -rad; dx <= rad; dx++) {
         int xx = ix + dx, yy = iy + dy;
         if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
         k = yy * w + xx;
