@@ -2,9 +2,17 @@
 # Summon Kinect control panel (C). Second run raises window.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$DIR/bin/kinect_panel"
-if [[ ! -x "$BIN" ]]; then
-  echo "kinect-panel: building C binary…" >&2
-  make -C "$DIR" -s
+for BIN in "$DIR/build/bin/kinect_panel" "$DIR/bin/kinect_panel"; do
+  if [[ -x "$BIN" ]]; then
+    exec "$BIN" "$@"
+  fi
+done
+echo "kinect-panel: configuring CMake and building…" >&2
+if command -v ninja >/dev/null && [[ -f "$DIR/CMakePresets.json" ]]; then
+  cmake --preset default -S "$DIR"
+  cmake --build "$DIR/build"
+else
+  cmake -S "$DIR" -B "$DIR/build" -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$DIR/build"
 fi
-exec "$BIN" "$@"
+exec "$DIR/build/bin/kinect_panel" "$@"

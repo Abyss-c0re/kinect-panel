@@ -1,8 +1,16 @@
 /bin/
+/build/
+/cmake-build-*/
 /__pycache__/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
 *.o
+*.a
 *.pyc
 *.so
 *~
 .DS_Store
 /tmp/
+.cache/
