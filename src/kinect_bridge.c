@@ -194,10 +194,8 @@ int kinect_bridge_start(const char *want_mode) {
     set_err("No Kinect /dev/video* (gspca)");
     return -1;
   }
-  if (kinect_find_vcam(vcam, sizeof vcam) < 0) {
-    set_err("No virtual webcam. Run: setup_loopback.sh --load");
-    return -1;
-  }
+  if (kinect_find_vcam(vcam, sizeof vcam) < 0)
+    vcam[0] = 0; /* preview / headless still run; loopback is OUT only */
   if (kinect_set_mode(source, mode) < 0) {
     set_err("v4l2 S_FMT failed");
     return -1;

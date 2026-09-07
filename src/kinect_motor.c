@@ -38,6 +38,8 @@ int kinect_motor_open(void) {
     return -1;
   }
   opened = 1;
+  /* Fresh motor open must not spend LED energy. Caller turns it on for a live session. */
+  freenect_set_led(dev, LED_OFF);
   pthread_mutex_unlock(&mu);
   return 0;
 }

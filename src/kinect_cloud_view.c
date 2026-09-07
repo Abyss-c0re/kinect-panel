@@ -387,7 +387,7 @@ void kinect_cloud_stop(void) {
     fg = NULL;
   }
   kinect_motor_inhibit(0);
-  kinect_motor_open();
+  /* Session owns power. Do not reopen motor — that left the LED/USB live. */
 }
 
 int kinect_cloud_running(void) {

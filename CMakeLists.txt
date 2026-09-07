@@ -17,7 +17,7 @@ if(EXISTS /opt/rocm AND NOT DEFINED CMAKE_PREFIX_PATH)
 endif()
 
 project(kinect-panel
-  VERSION 0.3.0
+  VERSION 0.4.0
   DESCRIPTION "Xbox 360 Kinect panel: RGB/IR webcam, tilt, depth cloud, ROCm frame-gen"
   LANGUAGES C
   HOMEPAGE_URL "https://github.com/Abyss-c0re/kinect-panel"
@@ -72,6 +72,7 @@ add_library(kinect_core STATIC
   src/kinect_ir.c
   src/kinect_cloud_view.c
   src/cube_kinect_cloud.c
+  src/kinect_session.c
 )
 target_include_directories(kinect_core
   PUBLIC

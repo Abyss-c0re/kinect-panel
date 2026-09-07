@@ -5,6 +5,7 @@
 #include "kinect_cloud_view.h"
 #include "kinect_ir.h"
 #include "kinect_motor.h"
+#include "kinect_session.h"
 #include "kinect_v4l.h"
 
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -12,11 +13,10 @@
 #include <libfreenect.h>
 #include <math.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #define STEP 5.0
@@ -30,8 +30,7 @@ static GtkWidget *sc_boost, *sc_bright, *sc_contrast, *sc_gamma, *sc_black, *sc_
 static GtkWidget *sc_near, *sc_far, *sc_stride, *sc_dot, *combo_color;
 static GtkWidget *sc_fg, *lbl_fg;
 static int camera_on, preview_on, closing, snap_busy, bridge_starting;
-static int sock_fd = -1;
-static char sock_path[256];
+static volatile sig_atomic_t got_sig;
 static char mode[8] = "RGB";
 static char source[64], vcam[64];
 static double target_tilt;
@@ -228,26 +227,15 @@ static gboolean on_bridge_fail(gpointer data) {
 }
 
 static void *arm_work(void *arg) {
-  const char *m = arg;
+  kinect_mode m = kinect_session_parse_mode(arg ? (const char *)arg : mode);
   int rc;
-  if (m && m[0] == 'C') {
-    kinect_bridge_stop();
-    rc = kinect_cloud_start();
-    if (rc == 0)
-      g_idle_add(on_bridge_ok, NULL);
-    else
-      g_idle_add(on_bridge_fail, g_strdup(kinect_cloud_error()));
-    return NULL;
-  }
-  kinect_cloud_stop();
-  usleep(200000); /* let freenect drop the USB camera so gspca can reopen */
+  if (m == KINECT_MODE_OFF) m = KINECT_MODE_RGB;
   kinect_bridge_set_ir_tune(&ir_tune);
-  rc = kinect_bridge_start(m);
-  if (rc == 0) {
-    kinect_motor_set_led(m && m[0] == 'I' ? LED_GREEN : LED_BLINK_GREEN);
+  rc = kinect_session_start(m);
+  if (rc == 0)
     g_idle_add(on_bridge_ok, NULL);
-  } else
-    g_idle_add(on_bridge_fail, g_strdup(kinect_bridge_error()));
+  else
+    g_idle_add(on_bridge_fail, g_strdup(kinect_session_error()));
   return NULL;
 }
 
@@ -273,9 +261,7 @@ static void on_cam(GtkToggleButton *b, gpointer u) {
     arm_camera();
   else {
     bridge_starting = 0;
-    kinect_bridge_stop();
-    kinect_cloud_stop();
-    kinect_motor_set_led(LED_OFF);
+    kinect_session_off();
     set_status("Camera OFF");
     refresh_dev();
   }
@@ -296,22 +282,14 @@ static void on_mode(GtkToggleButton *b, gpointer u) {
   if (cloud_frame) gtk_widget_set_sensitive(cloud_frame, is_cloud());
   /* Stay on Camera — Image tab is opt-in so tilt never disappears. */
   if (is_cloud()) {
-    /* Python viewer started on launch — do not wait for Camera ON. */
-    set_status("Cloud — capturing depth into this preview…");
+    if (camera_on)
+      arm_camera();
+    else
+      set_status("Mode Cloud · Camera ON starts live depth (headless: --headless --mode cloud)");
     if (!preview_on)
       gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_preview), TRUE);
-    if (!kinect_cloud_running() && !bridge_starting) {
-      pthread_t t;
-      bridge_starting = 1;
-      if (pthread_create(&t, NULL, arm_work, (gpointer) "CLOUD") == 0)
-        pthread_detach(t);
-      else
-        bridge_starting = 0;
-    } else
-      snap_async();
     return;
   }
-  kinect_cloud_stop();
   if (camera_on)
     arm_camera();
   if (!preview_on)
@@ -569,10 +547,7 @@ static gboolean poll_tilt(gpointer u) {
   return TRUE;
 }
 
-static int live_ok(void) {
-  if (is_cloud()) return kinect_cloud_running();
-  return kinect_bridge_running();
-}
+static int live_ok(void) { return kinect_session_running(); }
 
 static gboolean preview_tick(gpointer u) {
   (void)u;
@@ -619,70 +594,74 @@ static gboolean on_delete(GtkWidget *w, GdkEvent *e, gpointer u) {
   (void)w;
   (void)e;
   (void)u;
-  gtk_widget_hide(win);
+  /* X = quit. Hide is the explicit "keep process" path. */
+  gtk_widget_destroy(win);
   return TRUE;
 }
 
 static void raise_panel(void) {
+  if (!win) return;
   gtk_widget_show_all(win);
   gtk_window_present(GTK_WINDOW(win));
-  gtk_window_set_keep_above(GTK_WINDOW(win),
-                            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keep_above)));
+  if (keep_above)
+    gtk_window_set_keep_above(GTK_WINDOW(win),
+                              gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keep_above)));
+}
+
+static void ui_from_session(void) {
+  kinect_mode m = kinect_session_mode();
+  int on = kinect_session_running();
+  camera_on = on;
+  if (btn_cam) {
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_cam), on);
+    gtk_button_set_label(GTK_BUTTON(btn_cam), on ? "Camera ON" : "Camera OFF");
+  }
+  if (m == KINECT_MODE_IR)
+    snprintf(mode, sizeof mode, "IR");
+  else if (m == KINECT_MODE_CLOUD)
+    snprintf(mode, sizeof mode, "CLOUD");
+  else if (m == KINECT_MODE_RGB)
+    snprintf(mode, sizeof mode, "RGB");
+  refresh_dev();
+}
+
+static int gui_dispatch(const char *cmd, char *reply, size_t n) {
+  char low[128];
+  size_t i;
+  snprintf(low, sizeof low, "%s", cmd ? cmd : "");
+  for (i = 0; low[i]; i++)
+    if (low[i] >= 'A' && low[i] <= 'Z') low[i] = (char)(low[i] - 'A' + 'a');
+  if (strcmp(low, "raise") == 0) {
+    raise_panel();
+    snprintf(reply, n, "{\"ok\":true,\"action\":\"raise\"}\n");
+    return 0;
+  }
+  {
+    int q = kinect_session_dispatch(cmd, reply, n);
+    ui_from_session();
+    if (q) {
+      closing = 1;
+      gtk_main_quit();
+    }
+    return q;
+  }
 }
 
 static gboolean on_sock(GIOChannel *ch, GIOCondition c, gpointer u) {
-  int fd;
   (void)ch;
   (void)c;
   (void)u;
-  fd = accept(sock_fd, NULL, NULL);
-  if (fd >= 0) {
-    char b[8];
-    (void)read(fd, b, sizeof b);
-    close(fd);
-  }
-  raise_panel();
+  kinect_ctl_pump(gui_dispatch);
   return TRUE;
 }
 
-static int acquire_instance(void) {
-  struct sockaddr_un a;
-  const char *rt = getenv("XDG_RUNTIME_DIR");
-  GIOChannel *ch;
-  snprintf(sock_path, sizeof sock_path, "%s/kinect-panel.sock", rt && rt[0] ? rt : "/tmp");
-  sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sock_fd < 0) return 1;
-  memset(&a, 0, sizeof a);
-  a.sun_family = AF_UNIX;
-  snprintf(a.sun_path, sizeof a.sun_path, "%s", sock_path);
-  if (connect(sock_fd, (struct sockaddr *)&a, sizeof a) == 0) {
-    const char *msg = "RAISE\n";
-    (void)write(sock_fd, msg, 6);
-    close(sock_fd);
-    sock_fd = -1;
-    return 0;
-  }
-  close(sock_fd);
-  unlink(sock_path);
-  sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (bind(sock_fd, (struct sockaddr *)&a, sizeof a) < 0) return 1;
-  listen(sock_fd, 3);
-  ch = g_io_channel_unix_new(sock_fd);
-  g_io_add_watch(ch, G_IO_IN, on_sock, NULL);
-  g_io_channel_unref(ch);
-  return 1;
-}
-
 static void cleanup(void) {
-  closing = 1;
-  kinect_bridge_stop();
-  kinect_cloud_stop();
-  kinect_motor_close();
-  if (sock_fd >= 0) {
-    close(sock_fd);
-    unlink(sock_path);
-    sock_fd = -1;
+  if (closing && !kinect_session_running() && kinect_ctl_fd() < 0) {
+    /* already torn down */
   }
+  closing = 1;
+  kinect_session_off();
+  kinect_ctl_close();
 }
 
 static void on_destroy(GtkWidget *w, gpointer u) {
@@ -690,6 +669,19 @@ static void on_destroy(GtkWidget *w, gpointer u) {
   (void)u;
   cleanup();
   gtk_main_quit();
+}
+
+static void on_sig(int s) {
+  (void)s;
+  got_sig = 1;
+}
+
+static gboolean sig_tick(gpointer u) {
+  (void)u;
+  if (!got_sig) return TRUE;
+  cleanup();
+  gtk_main_quit();
+  return FALSE;
 }
 
 static void on_keep(GtkToggleButton *b, gpointer u) {
@@ -701,6 +693,12 @@ static void on_hide(GtkButton *b, gpointer u) {
   (void)b;
   (void)u;
   gtk_widget_hide(win);
+}
+
+static void on_quit_clicked(GtkButton *b, gpointer u) {
+  (void)b;
+  (void)u;
+  gtk_widget_destroy(win);
 }
 
 static gboolean boot(gpointer u) {
@@ -716,12 +714,12 @@ static gboolean boot(gpointer u) {
   kinect_cloud_set_tune(&ct);
   kinect_bridge_set_fg_boost(1);
   kinect_cloud_set_fg_boost(1);
+  kinect_session_off(); /* GUI boot: sensor dark until Camera ON */
   if (kinect_motor_open() == 0 && kinect_motor_get_tilt(&deg, &st) == 0) {
-    kinect_motor_set_led(LED_OFF);
     if (deg < TILT_MIN || deg > TILT_MAX) deg = 0;
     target_tilt = deg;
     gtk_range_set_value(GTK_RANGE(tilt_scale), deg);
-    set_status("Ready. RGB / IR / Cloud → Camera ON. IR sliders boost vision.");
+    set_status("Ready. Kinect OFF. RGB / IR / Cloud → Camera ON.");
   } else
     set_status("Motor: not available (USB motor busy?)");
   refresh_dev();
@@ -746,17 +744,118 @@ static GtkWidget *mk_scale(const char *name, double lo, double hi, double step, 
   return sc;
 }
 
-int main(int argc, char **argv) {
-  GtkWidget *root, *frame, *box, *row, *cam_box, *tilt_f, *tilt, *foot, *ir_box;
-  GtkWidget *btn_rgb, *btn_ir, *btn_cloud, *up, *dn, *lv, *hide, *snap, *tip;
-  GtkWidget *see, *reset, *page_cam, *page_img, *scroll_img;
-  GtkWidget *cloud_box, *cup, *room, *rview;
+static void usage(void) {
+  fputs(
+      "kinect-panel — Xbox 360 Kinect (C)\n"
+      "  (no args)                         GUI. Kinect OFF until Camera ON.\n"
+      "  --headless [--mode rgb|ir|cloud]  stream, no window. Only auto-start.\n"
+      "  --off                             LED off, streams off, USB released.\n"
+      "  --status                          JSON SoT line\n"
+      "  --quit                            stop the owner process\n"
+      "  --help\n",
+      stdout);
+}
 
-  gtk_init(&argc, &argv);
-  if (!acquire_instance()) {
-    fprintf(stderr, "Kinect panel already running — raised existing window.\n");
+static int send_or_local(const char *cmd, int orphan_off) {
+  char reply[320];
+  if (kinect_ctl_send(cmd, reply, sizeof reply) == 0) {
+    fputs(reply, stdout);
+    if (!strchr(reply, '\n')) fputc('\n', stdout);
     return 0;
   }
+  if (cmd && strncmp(cmd, "STATUS", 6) == 0) {
+    /* No owner: bits only. Do not touch USB. */
+    kinect_session_status_json(reply, sizeof reply);
+    fputs(reply, stdout);
+    return 0;
+  }
+  if (orphan_off) {
+    kinect_session_off();
+    kinect_session_status_json(reply, sizeof reply);
+    fputs(reply, stdout);
+    return 0;
+  }
+  fprintf(stderr, "kinect-panel: no owner process\n");
+  return 1;
+}
+
+int main(int argc, char **argv) {
+  GtkWidget *root, *frame, *box, *row, *cam_box, *tilt_f, *tilt, *foot, *ir_box;
+  GtkWidget *btn_rgb, *btn_ir, *btn_cloud, *up, *dn, *lv, *hide, *quitb, *snap, *tip;
+  GtkWidget *see, *reset, *page_cam, *page_img, *scroll_img;
+  GtkWidget *cloud_box, *cup, *room, *rview;
+  int want_headless = 0, want_off = 0, want_status = 0, want_quit = 0, i;
+  kinect_mode cli_mode = KINECT_MODE_RGB;
+  GIOChannel *ch;
+  char reply[320];
+
+  for (i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      usage();
+      return 0;
+    }
+    if (strcmp(argv[i], "--headless") == 0) {
+      want_headless = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--off") == 0) {
+      want_off = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--status") == 0) {
+      want_status = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--quit") == 0) {
+      want_quit = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+      cli_mode = kinect_session_parse_mode(argv[++i]);
+      if (cli_mode == KINECT_MODE_OFF) cli_mode = KINECT_MODE_RGB;
+      continue;
+    }
+    if (strncmp(argv[i], "--mode=", 7) == 0) {
+      cli_mode = kinect_session_parse_mode(argv[i] + 7);
+      if (cli_mode == KINECT_MODE_OFF) cli_mode = KINECT_MODE_RGB;
+      continue;
+    }
+    fprintf(stderr, "kinect-panel: unknown arg %s\n", argv[i]);
+    usage();
+    return 2;
+  }
+
+  if (want_status)
+    return send_or_local("STATUS", 1);
+  if (want_off)
+    return send_or_local("OFF", 1);
+  if (want_quit)
+    return send_or_local("QUIT", 0);
+  if (want_headless) {
+    if (kinect_ctl_send("STATUS", reply, sizeof reply) == 0) {
+      snprintf(reply, sizeof reply, "START %s", kinect_session_mode_name(cli_mode));
+      return send_or_local(reply, 0);
+    }
+    return kinect_headless_run(cli_mode);
+  }
+
+  if (kinect_ctl_send("RAISE", reply, sizeof reply) == 0) {
+    fputs(reply, stdout);
+    return 0;
+  }
+
+  gtk_init(&argc, &argv);
+  if (kinect_ctl_listen() < 0) {
+    fprintf(stderr, "kinect-panel: ctl bind failed\n");
+    return 1;
+  }
+  ch = g_io_channel_unix_new(kinect_ctl_fd());
+  g_io_add_watch(ch, G_IO_IN, on_sock, NULL);
+  g_io_channel_unref(ch);
+  signal(SIGINT, on_sig);
+  signal(SIGTERM, on_sig);
+  signal(SIGHUP, on_sig);
+  atexit(cleanup);
 
   win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
   gtk_window_set_title(GTK_WINDOW(win), "Kinect Panel");
@@ -946,12 +1045,16 @@ int main(int argc, char **argv) {
   g_signal_connect(keep_above, "toggled", G_CALLBACK(on_keep), NULL);
   hide = gtk_button_new_with_label("Hide");
   g_signal_connect(hide, "clicked", G_CALLBACK(on_hide), NULL);
+  quitb = gtk_button_new_with_label("Quit");
+  g_signal_connect(quitb, "clicked", G_CALLBACK(on_quit_clicked), NULL);
   gtk_box_pack_start(GTK_BOX(foot), keep_above, TRUE, TRUE, 0);
+  gtk_box_pack_end(GTK_BOX(foot), quitb, FALSE, FALSE, 0);
   gtk_box_pack_end(GTK_BOX(foot), hide, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(root), foot, FALSE, FALSE, 0);
 
   g_timeout_add(250, poll_tilt, NULL);
   g_timeout_add(200, preview_tick, NULL);
+  g_timeout_add(200, sig_tick, NULL);
   g_idle_add(boot, NULL);
   gtk_widget_show_all(win);
   gtk_main();
