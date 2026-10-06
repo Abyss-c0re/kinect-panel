@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Kinect OpenXR — same host path as gVRMod (CubeUI_host / gvrmod_launcher).
+# Pin WiVRn, start wivrn-server, launch the native OpenXR app so the HMD streams.
+set +e
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG="${KXR_LOG:-/tmp/kxr_openxr.log}"
+XYZ="${KXR_XYZ:-/home/voldemar/Dev/lab/prophecy_cube/state/trackers/kinect_latest.xyz}"
+
+{
+  echo "[kxr] $(date -Iseconds) start"
+  echo "[kxr] DISPLAY=${DISPLAY:-} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-} XR=${XR_RUNTIME_JSON:-}"
+} >>"$LOG" 2>&1
+
+BIN=""
+for c in "$DIR/build/bin/kxr_openxr" "$DIR/bin/kxr_openxr"; do
+  if [[ -x "$c" ]]; then BIN="$c"; break; fi
+done
+if [[ -z "$BIN" ]]; then
+  echo "[kxr] ERROR: kxr_openxr missing — build kinect-panel" >>"$LOG"
+  exit 0
+fi
+
+# Clean Steam / game runtime leakage (breaks host GLX + OpenXR) — CubeUI_host.sh
+unset LD_LIBRARY_PATH
+unset LD_PRELOAD
+unset STEAM_RUNTIME
+unset STEAM_RUNTIME_LIBRARY_PATH
+unset PRESSURE_VESSEL_FILESYSTEMS_RW
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# Pin OpenXR active runtime (WiVRn/Monado) — gvrmod_launcher.sh
+XR_JSON="${XR_RUNTIME_JSON:-}"
+if [[ -z "$XR_JSON" ]]; then
+  for c in \
+    /usr/share/openxr/1/openxr_wivrn.json \
+    /usr/local/share/openxr/1/openxr_wivrn.json \
+    /usr/share/openxr/1/openxr_monado.json
+  do
+    [[ -f "$c" ]] && { XR_JSON="$c"; break; }
+  done
+fi
+if [[ -z "$XR_JSON" || ! -f "$XR_JSON" ]]; then
+  echo "[kxr] ERROR: no OpenXR runtime (install WiVRn)." >>"$LOG"
+  exit 0
+fi
+export XR_RUNTIME_JSON="$XR_JSON"
+mkdir -p "$HOME/.config/openxr/1"
+ln -sfn "$XR_RUNTIME_JSON" "$HOME/.config/openxr/1/active_runtime.json"
+echo "[kxr] OpenXR=$XR_RUNTIME_JSON" >>"$LOG"
+
+# WiVRn server — same as gvrmod_launcher.sh
+if ! pgrep -x wivrn-server >/dev/null 2>&1; then
+  if command -v wivrn-server >/dev/null 2>&1; then
+    echo "[kxr] starting wivrn-server…" >>"$LOG"
+    wivrn-server >>/tmp/kxr-wivrn.log 2>&1 &
+    sleep 0.8
+  elif systemctl --user list-unit-files wivrn-server.service &>/dev/null; then
+    systemctl --user start wivrn-server.service 2>/dev/null || true
+    sleep 0.5
+  fi
+else
+  echo "[kxr] wivrn-server already running" >>"$LOG"
+fi
+
+cd "$DIR" || true
+# Live depth is the default — no dashboard / xyz publisher required.
+# --xyz is only a fallback if the USB open fails.
+if [[ $# -eq 0 ]]; then
+  echo "[kxr] exec $BIN --live --xyz $XYZ" >>"$LOG"
+  "$BIN" --live --xyz "$XYZ" >>"$LOG" 2>&1
+else
+  echo "[kxr] exec $BIN $*" >>"$LOG"
+  "$BIN" "$@" >>"$LOG" 2>&1
+fi
+echo "[kxr] exited rc=$?" >>"$LOG"
+exit 0

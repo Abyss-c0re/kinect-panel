@@ -73,7 +73,7 @@ void cube_cloud_free(cube_cloud *c) {
   cube_cloud_clear(c);
 }
 
-static int cloud_reserve(cube_cloud *c, int need) {
+int cube_cloud_reserve(cube_cloud *c, int need) {
   cube_cloud_pt *p;
   int cap = c->cap;
   if (need <= cap) return 0;
@@ -85,6 +85,23 @@ static int cloud_reserve(cube_cloud *c, int need) {
   if (!p) return -1;
   c->pt = p;
   c->cap = cap;
+  return 0;
+}
+
+int cube_cloud_copy(cube_cloud *dst, const cube_cloud *src) {
+  if (!dst || !src) return -1;
+  if (src->n > 0 && !src->pt) return -1;
+  if (cube_cloud_reserve(dst, src->n > 0 ? src->n : 1) < 0) {
+    snprintf(dst->err, sizeof dst->err, "oom");
+    return -1;
+  }
+  if (src->n > 0)
+    memcpy(dst->pt, src->pt, (size_t)src->n * sizeof(cube_cloud_pt));
+  dst->n = src->n;
+  dst->ok = src->ok;
+  dst->ts = src->ts;
+  memcpy(dst->err, src->err, sizeof dst->err);
+  memcpy(dst->path, src->path, sizeof dst->path);
   return 0;
 }
 
@@ -181,7 +198,7 @@ int cube_cloud_from_depth_ex(cube_cloud *c, const uint16_t *depth, const cube_cl
   zf = t->z_far;
   if (zn < 0.3f) zn = 0.3f;
   if (zf < zn + 0.1f) zf = zn + 0.1f;
-  if (cloud_reserve(c, (W / stride) * (H / stride) + 8) < 0) {
+  if (cube_cloud_reserve(c, (W / stride) * (H / stride) + 8) < 0) {
     snprintf(c->err, sizeof c->err, "oom");
     return -1;
   }
@@ -231,7 +248,7 @@ int cube_cloud_load_xyz(cube_cloud *c, const char *path, int max_pts) {
     snprintf(c->err, sizeof c->err, "cannot open %s", path);
     return -1;
   }
-  if (cloud_reserve(c, max_pts) < 0) {
+  if (cube_cloud_reserve(c, max_pts) < 0) {
     fclose(f);
     snprintf(c->err, sizeof c->err, "oom");
     return -1;
@@ -258,17 +275,20 @@ int cube_cloud_load_xyz(cube_cloud *c, const char *path, int max_pts) {
 }
 
 int cube_cloud_write_xyz(const cube_cloud *c, const char *path) {
+  char tmp[400];
   FILE *f;
   int i;
   if (!c || !path) return -1;
   if (parent_mkdir(path) < 0) return -1;
-  f = fopen(path, "w");
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  f = fopen(tmp, "w");
   if (!f) return -1;
   for (i = 0; i < c->n; i++) {
     const cube_cloud_pt *p = &c->pt[i];
     fprintf(f, "%.5f %.5f %.5f %d %d %d\n", p->x, p->y, p->z, p->r, p->g, p->b);
   }
-  fclose(f);
+  if (fclose(f) != 0) return -1;
+  if (rename(tmp, path) != 0) return -1;
   return 0;
 }
 

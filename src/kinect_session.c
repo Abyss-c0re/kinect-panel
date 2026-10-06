@@ -3,7 +3,9 @@
 #include "kinect_session.h"
 #include "kinect_bridge.h"
 #include "kinect_cloud_view.h"
+#include "kinect_fuse.h"
 #include "kinect_motor.h"
+#include "kinect2_device.h"
 
 #include <errno.h>
 #include <libfreenect.h>
@@ -95,9 +97,13 @@ int kinect_session_start(kinect_mode mode) {
   set_err("");
 
   if (mode == KINECT_MODE_CLOUD) {
+    char why[160];
     rc = kinect_cloud_start();
     if (rc != 0) {
-      set_err(kinect_cloud_error());
+      snprintf(why, sizeof why, "%s", kinect_cloud_error());
+      /* cloud_start can return while a dump fallback or a slow open is still up. */
+      kinect_cloud_stop();
+      set_err(why[0] ? why : "cloud start failed");
       pthread_mutex_lock(&mu);
       cur = KINECT_MODE_OFF;
       pthread_mutex_unlock(&mu);
@@ -110,12 +116,14 @@ int kinect_session_start(kinect_mode mode) {
     rc = kinect_bridge_start(m);
     if (rc != 0) {
       set_err(kinect_bridge_error());
+      kinect_bridge_stop();
       pthread_mutex_lock(&mu);
       cur = KINECT_MODE_OFF;
       pthread_mutex_unlock(&mu);
       return -1;
     }
-    live_led(mode);
+    /* Kinect 2 lights its own lamp. Do not open the Kinect motor for that. */
+    if (kinect_bridge_sensor() != 2) live_led(mode);
   }
 
   pthread_mutex_lock(&mu);
@@ -149,16 +157,47 @@ const char *kinect_session_error(void) { return err; }
 
 void kinect_session_status_json(char *buf, size_t n) {
   kinect_mode m;
-  int run, hl;
+  kinect_fuse_stats st;
+  kinect_src sel;
+  int run, hl, v1, v2, skew, paired;
+  const char *src;
+  const char *pipe;
   if (!buf || !n) return;
   pthread_mutex_lock(&mu);
   m = cur;
   hl = headless;
   pthread_mutex_unlock(&mu);
   run = kinect_session_running();
+  /* Source is a setting. Stats are the last session, not a USB probe. */
+  sel = kinect_fuse_source();
+  kinect_fuse_get_stats(&st);
+  v1 = 0;
+  v2 = 0;
+  skew = -1;
+  paired = 0;
+  pipe = "";
+  src = kinect_src_name(sel);
+  if (run && m == KINECT_MODE_CLOUD) {
+    src = kinect_src_name(st.active);
+    v1 = st.v1_open ? 1 : 0;
+    v2 = st.v2_open ? 1 : 0;
+    paired = st.paired ? 1 : 0;
+    if (paired && st.skew_us >= 0) skew = st.skew_us / 1000;
+    if (v2 && st.pipeline[0]) pipe = st.pipeline;
+  } else if (run && (m == KINECT_MODE_RGB || m == KINECT_MODE_IR)) {
+    int sens = kinect_bridge_sensor();
+    if (sens == 2) {
+      v2 = 1;
+      if (kinect2_pipeline()[0]) pipe = kinect2_pipeline();
+    } else if (sens == 1) {
+      v1 = 1;
+    }
+  }
   snprintf(buf, n,
-           "{\"ok\":true,\"running\":%s,\"mode\":\"%s\",\"headless\":%s,\"collect\":false}\n",
-           run ? "true" : "false", kinect_session_mode_name(m), hl ? "true" : "false");
+           "{\"ok\":true,\"running\":%s,\"mode\":\"%s\",\"headless\":%s,\"collect\":false,"
+           "\"src\":\"%s\",\"v1\":%s,\"v2\":%s,\"skew_ms\":%d,\"paired\":%s,\"pipe\":\"%s\"}\n",
+           run ? "true" : "false", kinect_session_mode_name(m), hl ? "true" : "false", src,
+           v1 ? "true" : "false", v2 ? "true" : "false", skew, paired ? "true" : "false", pipe);
 }
 
 int kinect_ctl_path(char *out, size_t n) {
@@ -225,7 +264,7 @@ int kinect_ctl_send(const char *cmd, char *reply, size_t n) {
 
 void kinect_ctl_pump(int (*dispatch)(const char *cmd, char *reply, size_t n)) {
   int cfd;
-  char cmd[128], reply[320];
+  char cmd[128], reply[512];
   ssize_t r;
   size_t L;
   struct timeval tv;
@@ -271,6 +310,20 @@ static void trim_cmd(char *s) {
   }
 }
 
+static void split_two(const char *arg, char *a, size_t na, char *b, size_t nb) {
+  size_t i = 0;
+  if (!arg) arg = "";
+  if (na) a[0] = 0;
+  if (nb) b[0] = 0;
+  while (*arg == ' ' || *arg == '\t') arg++;
+  while (*arg && *arg != ' ' && *arg != '\t' && i + 1 < na) a[i++] = *arg++;
+  if (na) a[i] = 0;
+  while (*arg == ' ' || *arg == '\t') arg++;
+  i = 0;
+  while (*arg && *arg != ' ' && *arg != '\t' && i + 1 < nb) b[i++] = *arg++;
+  if (nb) b[i] = 0;
+}
+
 int kinect_session_dispatch(const char *cmd, char *reply, size_t n) {
   char buf[128];
   if (!cmd || !reply || !n) return 0;
@@ -292,12 +345,46 @@ int kinect_session_dispatch(const char *cmd, char *reply, size_t n) {
     kinect_session_status_json(reply, n);
     return 0;
   }
+  if (strcmp(buf, "align reset") == 0) {
+    kinect_fuse_reset_rigid();
+    kinect_session_status_json(reply, n);
+    return 0;
+  }
+  if (strcmp(buf, "align") == 0) {
+    ksync_align_result res;
+    if (kinect_fuse_align(&res) != 0) {
+      const char *e = kinect_fuse_error();
+      snprintf(reply, n, "{\"ok\":false,\"error\":\"%s\"}\n",
+               e && e[0] ? e : "align failed");
+    } else {
+      snprintf(reply, n,
+               "{\"ok\":true,\"action\":\"align\",\"residual_m\":%.4f,\"inliers\":%d,"
+               "\"yaw_deg\":%.2f,\"pitch_deg\":%.2f}\n",
+               res.residual_m, res.inliers, res.yaw_deg, res.pitch_deg);
+    }
+    return 0;
+  }
   if (strncmp(buf, "start", 5) == 0) {
     const char *arg = buf + 5;
+    char tok[32], extra[32];
     kinect_mode m;
-    while (*arg == ' ' || *arg == '\t') arg++;
-    m = kinect_session_parse_mode(arg[0] ? arg : "rgb");
-    if (m == KINECT_MODE_OFF) m = KINECT_MODE_RGB;
+    kinect_src src;
+    split_two(arg, tok, sizeof tok, extra, sizeof extra);
+    if (!tok[0]) {
+      m = KINECT_MODE_RGB;
+    } else if (strcmp(tok, "cloud") == 0) {
+      m = KINECT_MODE_CLOUD;
+      /* No suffix keeps the current sensor. A known suffix selects it. */
+      if (extra[0] && kinect_src_known(extra, &src)) kinect_fuse_set_source(src);
+    } else if (kinect_src_known(tok, &src) && src != KINECT_SRC_AUTO) {
+      m = KINECT_MODE_CLOUD;
+      kinect_fuse_set_source(src);
+    } else {
+      m = kinect_session_parse_mode(tok);
+      if (m == KINECT_MODE_OFF) m = KINECT_MODE_RGB;
+      /* START rgb v2 / START ir both — suffix selects the camera too. */
+      if (extra[0] && kinect_src_known(extra, &src)) kinect_fuse_set_source(src);
+    }
     if (kinect_session_start(m) != 0)
       snprintf(reply, n, "{\"ok\":false,\"error\":\"%s\"}\n",
                err[0] ? err : "start failed");

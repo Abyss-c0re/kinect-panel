@@ -11,6 +11,8 @@ extern "C" {
 int kinect_bridge_start(const char *mode);
 void kinect_bridge_stop(void);
 int kinect_bridge_running(void);
+/* 1 = Kinect gspca, 2 = Kinect 2 color/IR, 0 = not streaming. */
+int kinect_bridge_sensor(void);
 const char *kinect_bridge_error(void);
 const char *kinect_bridge_vcam(void);
 int kinect_bridge_preview_rgb(uint8_t *rgb /* 640*480*3 */);

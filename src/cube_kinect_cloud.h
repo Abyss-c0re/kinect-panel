@@ -28,6 +28,8 @@ typedef struct cube_cloud {
 void cube_cloud_init(cube_cloud *c);
 void cube_cloud_clear(cube_cloud *c);
 void cube_cloud_free(cube_cloud *c);
+int cube_cloud_reserve(cube_cloud *c, int need);
+int cube_cloud_copy(cube_cloud *dst, const cube_cloud *src);
 
 /* Stop cube_daemon / freenect viewers that hold the camera. */
 void cube_cloud_free_holders(void);

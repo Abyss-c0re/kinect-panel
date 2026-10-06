@@ -3,13 +3,14 @@
 /* One USB owner. Motor inhibited. Live frames only. Dump via posix_spawn if needed. */
 #include "kinect_cloud_view.h"
 #include "cube_kinect_cloud.h"
+#include "cube_kinect_mesh.h"
 #include "cube_paths.h"
+#include "kinect_fuse.h"
 #include "kinect_motor.h"
 #include "kinect_v4l.h"
 #include "fg/fg.h"
 
 #include <fcntl.h>
-#include <libfreenect.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -33,17 +34,17 @@ static char err[160];
 static uint8_t *front, *back;
 static int have_preview, npoints;
 static float elev = 18.f, azim = -60.f, dist = 3.2f;
-static double last_tilt, pending_tilt;
-static int last_tilt_st, have_pending_tilt;
 static cube_cloud_tune tune;
 static int tune_inited, tune_dirty;
 static fg_engine *fg;
 static int fg_boost;
 
 static uint16_t *depth_keep;
-static int depth_new;
 static pthread_mutex_t depth_mu = PTHREAD_MUTEX_INITIALIZER;
-static freenect_device *live_dev;
+static cube_cloud snap_cloud;
+static int have_snap;
+static cube_mesh snap_mesh;
+static int solid_3d = 1;
 
 static void set_err(const char *s) {
   pthread_mutex_lock(&mu);
@@ -51,20 +52,18 @@ static void set_err(const char *s) {
   pthread_mutex_unlock(&mu);
 }
 
-static void depth_cb(freenect_device *dev, void *depth, uint32_t ts) {
-  (void)dev;
-  (void)ts;
-  if (!depth_keep || !depth) return;
-  pthread_mutex_lock(&depth_mu);
-  memcpy(depth_keep, depth, (size_t)DEP_N * sizeof(uint16_t));
-  depth_new = 1;
-  pthread_mutex_unlock(&depth_mu);
-}
-
 static void paint(cube_cloud *cloud, float e, float a, float d) {
   uint8_t *tmp;
+  int use_mesh;
   if (!back) return;
-  if (cube_cloud_render_rgb_ex(cloud, back, KINECT_RGB_W, KINECT_RGB_H, e, a, d, tune.dot) < 0)
+  pthread_mutex_lock(&mu);
+  use_mesh = solid_3d && snap_mesh.ok;
+  pthread_mutex_unlock(&mu);
+  if (use_mesh) {
+    if (cube_mesh_render_rgb(&snap_mesh, back, KINECT_RGB_W, KINECT_RGB_H, e, a, d) < 0)
+      return;
+  } else if (cube_cloud_render_rgb_ex(cloud, back, KINECT_RGB_W, KINECT_RGB_H, e, a, d,
+                                      tune.dot) < 0)
     return;
   pthread_mutex_lock(&mu);
   tmp = front;
@@ -72,6 +71,8 @@ static void paint(cube_cloud *cloud, float e, float a, float d) {
   back = tmp;
   have_preview = 1;
   npoints = cloud->n;
+  if (cube_cloud_copy(&snap_cloud, cloud) == 0)
+    have_snap = 1;
   pthread_mutex_unlock(&mu);
 }
 
@@ -198,107 +199,16 @@ static int loop_dump(cube_cloud *cloud) {
   return 0;
 }
 
-static int loop_live(cube_cloud *cloud) {
-  freenect_context *ctx = NULL;
-  freenect_device *dev = NULL;
-  freenect_frame_mode mode;
-  int frames = 0, waited = 0;
-
-  if (freenect_init(&ctx, NULL) < 0) return -1;
-  freenect_set_log_level(ctx, FREENECT_LOG_FATAL);
-  freenect_select_subdevices(ctx, (freenect_device_flags)(FREENECT_DEVICE_MOTOR | FREENECT_DEVICE_CAMERA));
-  if (freenect_num_devices(ctx) < 1 || freenect_open_device(ctx, &dev, 0) < 0) {
-    freenect_shutdown(ctx);
-    return -1;
-  }
-  mode = freenect_find_depth_mode(FREENECT_RESOLUTION_MEDIUM, FREENECT_DEPTH_11BIT);
-  if (!mode.is_valid || freenect_set_depth_mode(dev, mode) < 0 ||
-      freenect_start_depth(dev) < 0) {
-    freenect_close_device(dev);
-    freenect_shutdown(ctx);
-    return -1;
-  }
-  freenect_set_depth_callback(dev, depth_cb);
-  freenect_set_led(dev, LED_YELLOW);
-  live_dev = dev;
-
-  pthread_mutex_lock(&mu);
-  running = 1;
-  pthread_mutex_unlock(&mu);
-
-  while (!stop_flag) {
-    struct timeval tv = {0, 30000};
-    float e, a, d;
-    int fresh = 0;
-    freenect_process_events_timeout(ctx, &tv);
-
-    pthread_mutex_lock(&mu);
-    e = elev;
-    a = azim;
-    d = dist;
-    if (have_pending_tilt && live_dev) {
-      freenect_set_tilt_degs(live_dev, pending_tilt);
-      have_pending_tilt = 0;
-    }
-    pthread_mutex_unlock(&mu);
-
-    if (live_dev) {
-      freenect_raw_tilt_state *st;
-      freenect_update_tilt_state(live_dev);
-      st = freenect_get_tilt_state(live_dev);
-      if (st) {
-        pthread_mutex_lock(&mu);
-        last_tilt = freenect_get_tilt_degs(st);
-        last_tilt_st = (int)freenect_get_tilt_status(st);
-        pthread_mutex_unlock(&mu);
-      }
-    }
-
-    pthread_mutex_lock(&depth_mu);
-    fresh = depth_new;
-    depth_new = 0;
-    pthread_mutex_unlock(&depth_mu);
-    {
-      cube_cloud_tune tcopy;
-      int dirty;
-      pthread_mutex_lock(&mu);
-      if (!tune_inited) {
-        cube_cloud_tune_default(&tune);
-        tune_inited = 1;
-      }
-      tcopy = tune;
-      dirty = tune_dirty;
-      tune_dirty = 0;
-      pthread_mutex_unlock(&mu);
-      if (!fresh && !dirty) {
-        if (!live_frames && ++waited > 80) break; /* ~2.4s no frames → dump */
-        continue;
-      }
-      waited = 0;
-      if (cube_cloud_from_depth_ex(cloud, depth_keep, &tcopy) == 0 && cloud->n > 0) {
-        paint(cloud, e, a, d);
-        pthread_mutex_lock(&mu);
-        live_frames++;
-        err[0] = 0;
-        pthread_mutex_unlock(&mu);
-        emit_fg();
-        if ((++frames % 8) == 0) cube_cloud_publish(cloud);
-      }
-    }
-  }
-
-  live_dev = NULL;
-  freenect_stop_depth(dev);
-  freenect_set_led(dev, LED_OFF);
-  freenect_close_device(dev);
-  freenect_shutdown(ctx);
-  return live_frames > 0 ? 0 : -1;
-}
-
 static void *cloud_main(void *arg) {
   cube_cloud cloud;
+  uint32_t seen = 0;
   (void)arg;
   cube_cloud_init(&cloud);
+  pthread_mutex_lock(&mu);
+  if (!snap_cloud.pt) cube_cloud_init(&snap_cloud);
+  cube_mesh_init(&snap_mesh);
+  have_snap = 0;
+  pthread_mutex_unlock(&mu);
   front = (uint8_t *)calloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3, 1);
   back = (uint8_t *)calloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3, 1);
   depth_keep = (uint16_t *)calloc(DEP_N, sizeof(uint16_t));
@@ -313,12 +223,59 @@ static void *cloud_main(void *arg) {
   kinect_motor_close();
   cube_cloud_free_holders();
   usleep(300000);
+  if (tune_inited) kinect_fuse_set_tune(&tune);
 
-  if (loop_live(&cloud) < 0 && !stop_flag) {
-    /* Honest fallback: exclusive dump child, parent holds no libusb. */
-    set_err("live open failed — dump");
-    loop_dump(&cloud);
+  if (kinect_fuse_start() != 0) {
+    if (!stop_flag) {
+      const char *fe = kinect_fuse_error();
+      kinect_src src = kinect_fuse_source();
+      set_err(fe && fe[0] ? fe : "live open failed");
+      /* Dump child is the v1-only fallback. It cannot see Kinect 2. */
+      if (src == KINECT_SRC_AUTO || src == KINECT_SRC_V1) loop_dump(&cloud);
+    }
+    goto done;
   }
+
+  pthread_mutex_lock(&mu);
+  running = 1;
+  pthread_mutex_unlock(&mu);
+
+  while (!stop_flag) {
+    kinect_fuse_stats st;
+    float e, a, d;
+    int solid;
+    cube_cloud_tune tcopy;
+    kinect_fuse_get_stats(&st);
+    pthread_mutex_lock(&mu);
+    e = elev;
+    a = azim;
+    d = dist;
+    solid = solid_3d;
+    if (!tune_inited) {
+      cube_cloud_tune_default(&tune);
+      tune.color = 3;
+      tune_inited = 1;
+    }
+    tcopy = tune;
+    pthread_mutex_unlock(&mu);
+    if (st.seq != seen && kinect_fuse_snapshot(&cloud) == 0 && cloud.n > 0) {
+      seen = st.seq;
+      if (solid && st.active == KINECT_SRC_V1 && depth_keep &&
+          kinect_fuse_copy_v1_depth(depth_keep) == 0)
+        cube_mesh_from_depth(&snap_mesh, depth_keep, &tcopy);
+      else
+        cube_mesh_clear(&snap_mesh);
+      paint(&cloud, e, a, d);
+      pthread_mutex_lock(&mu);
+      live_frames++;
+      err[0] = 0;
+      pthread_mutex_unlock(&mu);
+      emit_fg();
+      cube_cloud_publish(&cloud);
+    }
+    usleep(12000);
+  }
+  kinect_fuse_stop();
 
 done:
   cube_cloud_free(&cloud);
@@ -348,7 +305,7 @@ int kinect_cloud_start(void) {
   started = 1;
   {
     int i;
-    for (i = 0; i < 200; i++) {
+    for (i = 0; i < 900; i++) {
       int run, lf;
       char e0[160];
       pthread_mutex_lock(&mu);
@@ -356,9 +313,8 @@ int kinect_cloud_start(void) {
       lf = live_frames;
       snprintf(e0, sizeof e0, "%s", err);
       pthread_mutex_unlock(&mu);
-      if (lf > 0) return 0;
-      if (run && i > 12) return 0; /* thread owns USB; UI waits for live */
-      if (e0[0] && !run && i > 16) return -1;
+      if (lf > 0 || run) return 0;
+      if (e0[0] && !run && i > 15) return -1;
       usleep(25000);
     }
   }
@@ -370,15 +326,18 @@ int kinect_cloud_start(void) {
 void kinect_cloud_stop(void) {
   if (!started) return;
   stop_flag = 1;
+  kinect_fuse_request_stop();
   pthread_join(th, NULL);
   started = 0;
   running = 0;
-  live_dev = NULL;
   pthread_mutex_lock(&mu);
   free(front);
   free(back);
   front = back = NULL;
   have_preview = 0;
+  have_snap = 0;
+  cube_cloud_free(&snap_cloud);
+  cube_mesh_free(&snap_mesh);
   pthread_mutex_unlock(&mu);
   free(depth_keep);
   depth_keep = NULL;
@@ -426,6 +385,27 @@ int kinect_cloud_points(void) {
   return n;
 }
 
+int kinect_cloud_snapshot(cube_cloud *out) {
+  int rc;
+  if (!out) return -1;
+  pthread_mutex_lock(&mu);
+  if (!have_snap) {
+    pthread_mutex_unlock(&mu);
+    return -1;
+  }
+  rc = cube_cloud_copy(out, &snap_cloud);
+  pthread_mutex_unlock(&mu);
+  return rc;
+}
+
+int kinect_cloud_copy_depth(uint16_t *depth) {
+  if (!depth || !depth_keep) return -1;
+  pthread_mutex_lock(&depth_mu);
+  memcpy(depth, depth_keep, (size_t)DEP_N * sizeof(uint16_t));
+  pthread_mutex_unlock(&depth_mu);
+  return 0;
+}
+
 void kinect_cloud_orbit(float e, float a, float d) {
   pthread_mutex_lock(&mu);
   elev = e;
@@ -442,22 +422,10 @@ void kinect_cloud_get_orbit(float *e, float *a, float *d) {
   pthread_mutex_unlock(&mu);
 }
 
-int kinect_cloud_set_tilt(double degrees) {
-  if (degrees < -30) degrees = -30;
-  if (degrees > 30) degrees = 30;
-  pthread_mutex_lock(&mu);
-  pending_tilt = degrees;
-  have_pending_tilt = 1;
-  pthread_mutex_unlock(&mu);
-  return 0;
-}
+int kinect_cloud_set_tilt(double degrees) { return kinect_fuse_set_tilt(degrees); }
 
 int kinect_cloud_get_tilt(double *degrees, int *status) {
-  pthread_mutex_lock(&mu);
-  if (degrees) *degrees = last_tilt;
-  if (status) *status = last_tilt_st;
-  pthread_mutex_unlock(&mu);
-  return 0;
+  return kinect_fuse_get_tilt(degrees, status);
 }
 
 void kinect_cloud_set_tune(const cube_cloud_tune *t) {
@@ -470,10 +438,11 @@ void kinect_cloud_set_tune(const cube_cloud_tune *t) {
   if (tune.z_far < tune.z_near + 0.15f) tune.z_far = tune.z_near + 0.15f;
   if (tune.dot < 1) tune.dot = 1;
   if (tune.dot > 4) tune.dot = 4;
-  if (tune.color < 0 || tune.color > 2) tune.color = 0;
+  if (tune.color < 0 || tune.color > 3) tune.color = 0;
   tune_inited = 1;
   tune_dirty = 1;
   pthread_mutex_unlock(&mu);
+  kinect_fuse_set_tune(&tune);
 }
 
 void kinect_cloud_get_tune(cube_cloud_tune *t) {
@@ -481,10 +450,26 @@ void kinect_cloud_get_tune(cube_cloud_tune *t) {
   pthread_mutex_lock(&mu);
   if (!tune_inited) {
     cube_cloud_tune_default(&tune);
+    tune.color = 3;
     tune_inited = 1;
   }
   *t = tune;
   pthread_mutex_unlock(&mu);
+}
+
+void kinect_cloud_set_solid(int on) {
+  pthread_mutex_lock(&mu);
+  solid_3d = on ? 1 : 0;
+  tune_dirty = 1;
+  pthread_mutex_unlock(&mu);
+}
+
+int kinect_cloud_get_solid(void) {
+  int v;
+  pthread_mutex_lock(&mu);
+  v = solid_3d;
+  pthread_mutex_unlock(&mu);
+  return v;
 }
 
 void kinect_cloud_set_fg_boost(int mid_frames) {

@@ -3,6 +3,8 @@
 #include "kinect_bridge.h"
 #include "kinect_ir.h"
 #include "kinect_v4l.h"
+#include "kinect2_device.h"
+#include "kinect_fuse.h"
 #include "fg/fg.h"
 
 #include <linux/videodev2.h>
@@ -25,6 +27,7 @@ static char mode[8] = "RGB";
 static char source[64];
 static char vcam[64];
 static char err[160];
+static int sensor; /* 1 = Kinect gspca, 2 = Kinect 2, while running */
 static uint8_t preview[KINECT_RGB_W * KINECT_RGB_H * 3];
 static int have_preview;
 static kinect_ir_tune ir_tune;
@@ -35,6 +38,47 @@ static void set_err(const char *s) {
   pthread_mutex_lock(&mu);
   snprintf(err, sizeof err, "%s", s);
   pthread_mutex_unlock(&mu);
+}
+
+/* Preview first, then optional frame-gen mids, then the loopback. */
+static void publish_rgb(uint8_t *rgb, uint8_t *yuyv, int vfd) {
+  int nout = 1, fi, mid;
+  uint8_t *gen = NULL;
+  pthread_mutex_lock(&mu);
+  mid = fg_boost;
+  pthread_mutex_unlock(&mu);
+  if (mid > 0 && !fg) fg = fg_create();
+  if (fg && mid > 0) {
+    fg_set_boost(fg, mid);
+    nout = fg_push_rgb(fg, rgb);
+    if (nout < 1) nout = 1;
+    gen = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
+  }
+  for (fi = 0; fi < nout; fi++) {
+    uint8_t *fr = rgb;
+    if (gen && fg_copy(fg, fi, gen) == 0) fr = gen;
+    pthread_mutex_lock(&mu);
+    memcpy(preview, fr, sizeof preview);
+    have_preview = 1;
+    pthread_mutex_unlock(&mu);
+    if (vfd >= 0) {
+      kinect_rgb_to_yuyv(fr, yuyv);
+      (void)kinect_vcam_write_yuyv(vfd, yuyv);
+    }
+    if (fi + 1 < nout) usleep(6000);
+  }
+  free(gen);
+}
+
+/* Kinect camera if it has a gspca node. Kinect 2 or Both uses libfreenect2.
+ * Auto uses gspca when that node exists, otherwise Kinect 2. */
+static int image_from_v2(void) {
+  kinect_src s = kinect_fuse_source();
+  char node[64];
+  if (s == KINECT_SRC_V2 || s == KINECT_SRC_BOTH) return 1;
+  if (s == KINECT_SRC_V1) return 0;
+  if (kinect_find_source(node, sizeof node) == 0) return 0;
+  return 1;
 }
 
 static void *bridge_main(void *arg) {
@@ -75,6 +119,7 @@ static void *bridge_main(void *arg) {
   /* Preview must work even if the loopback write side is missing/blocked. */
 
   pthread_mutex_lock(&mu);
+  sensor = 1;
   running = 1;
   pthread_mutex_unlock(&mu);
 
@@ -132,40 +177,7 @@ static void *bridge_main(void *arg) {
         }
       }
     }
-    /* Always publish the real frame to the panel first. */
-    pthread_mutex_lock(&mu);
-    memcpy(preview, rgb, sizeof preview);
-    have_preview = 1;
-    pthread_mutex_unlock(&mu);
-
-    {
-      int nout = 1, fi, mid;
-      uint8_t *gen = NULL;
-      pthread_mutex_lock(&mu);
-      mid = fg_boost;
-      pthread_mutex_unlock(&mu);
-      if (mid > 0 && !fg) fg = fg_create();
-      if (fg && mid > 0) {
-        fg_set_boost(fg, mid);
-        nout = fg_push_rgb(fg, rgb);
-        if (nout < 1) nout = 1;
-        gen = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
-      }
-      for (fi = 0; fi < nout; fi++) {
-        uint8_t *fr = rgb;
-        if (gen && fg_copy(fg, fi, gen) == 0) fr = gen;
-        pthread_mutex_lock(&mu);
-        memcpy(preview, fr, sizeof preview);
-        have_preview = 1;
-        pthread_mutex_unlock(&mu);
-        if (vfd >= 0) {
-          kinect_rgb_to_yuyv(fr, yuyv);
-          (void)kinect_vcam_write_yuyv(vfd, yuyv);
-        }
-        if (fi + 1 < nout) usleep(6000);
-      }
-      free(gen);
-    }
+    publish_rgb(rgb, yuyv, vfd);
   }
 
   kinect_cap_close(&cap);
@@ -178,11 +190,95 @@ out:
   free(fgbuf);
   pthread_mutex_lock(&mu);
   running = 0;
+  sensor = 0;
+  pthread_mutex_unlock(&mu);
+  return NULL;
+}
+
+static void *bridge_v2(void *arg) {
+  int vfd = -1;
+  int ir = (mode[0] == 'I' || mode[0] == 'i');
+  int opened = 0;
+  uint8_t *rgb = NULL, *yuyv = NULL, *grey = NULL;
+  uint16_t *ir16 = NULL;
+  const char *why;
+  (void)arg;
+
+  rgb = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
+  yuyv = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 2);
+  if (ir) {
+    grey = (uint8_t *)malloc((size_t)KINECT2_N);
+    ir16 = (uint16_t *)malloc((size_t)KINECT2_N * sizeof(uint16_t));
+  }
+  if (!rgb || !yuyv || (ir && (!grey || !ir16))) {
+    set_err("oom");
+    goto out;
+  }
+  if (ir) {
+    if (kinect2_open_ir() != 0) {
+      why = kinect2_error();
+      set_err(why && why[0] ? why : "kinect 2 ir failed");
+      goto out;
+    }
+  } else if (kinect2_open_color() != 0) {
+    why = kinect2_error();
+    set_err(why && why[0] ? why : "kinect 2 color failed");
+    goto out;
+  }
+  opened = 1;
+  vfd = kinect_vcam_open(vcam);
+
+  pthread_mutex_lock(&mu);
+  sensor = 2;
+  running = 1;
+  pthread_mutex_unlock(&mu);
+
+  while (!stop_flag) {
+    if (ir) {
+      kinect_ir_tune t;
+      int got = kinect2_take_ir(ir16, 200);
+      if (got == 0) continue;
+      if (got < 0) {
+        set_err("kinect 2 ir read failed");
+        break;
+      }
+      pthread_mutex_lock(&mu);
+      t = ir_tune;
+      pthread_mutex_unlock(&mu);
+      /* Grade expects the Kinect 10-bit range. Kinect 2 IR is 16-bit. */
+      {
+        int i;
+        for (i = 0; i < KINECT2_N; i++) ir16[i] = (uint16_t)(ir16[i] >> 6);
+      }
+      kinect_ir_grade(ir16, grey, KINECT2_N, &t);
+      kinect_ir_grey_to_rgb640(grey, KINECT2_W, KINECT2_H, rgb);
+    } else {
+      int got = kinect2_take_rgb(rgb, 200);
+      if (got == 0) continue;
+      if (got < 0) {
+        set_err("kinect 2 color read failed");
+        break;
+      }
+    }
+    publish_rgb(rgb, yuyv, vfd);
+  }
+
+out:
+  if (opened) kinect2_close();
+  if (vfd >= 0) close(vfd);
+  free(rgb);
+  free(yuyv);
+  free(grey);
+  free(ir16);
+  pthread_mutex_lock(&mu);
+  running = 0;
+  sensor = 0;
   pthread_mutex_unlock(&mu);
   return NULL;
 }
 
 int kinect_bridge_start(const char *want_mode) {
+  int use_v2, spins, i;
   kinect_bridge_stop();
   pthread_mutex_lock(&mu);
   err[0] = 0;
@@ -190,37 +286,45 @@ int kinect_bridge_start(const char *want_mode) {
   if (ir_tune.boost < 0.1f) kinect_ir_tune_default(&ir_tune);
   snprintf(mode, sizeof mode, "%s", (want_mode && want_mode[0] == 'I') ? "IR" : "RGB");
   pthread_mutex_unlock(&mu);
-  if (kinect_find_source(source, sizeof source) < 0) {
-    set_err("No Kinect /dev/video* (gspca)");
-    return -1;
-  }
   if (kinect_find_vcam(vcam, sizeof vcam) < 0)
     vcam[0] = 0; /* preview / headless still run; loopback is OUT only */
-  if (kinect_set_mode(source, mode) < 0) {
-    set_err("v4l2 S_FMT failed");
-    return -1;
+  use_v2 = image_from_v2();
+  if (use_v2) {
+    snprintf(source, sizeof source, "kinect2");
+  } else {
+    if (kinect_find_source(source, sizeof source) < 0) {
+      set_err("No Kinect /dev/video* (gspca)");
+      return -1;
+    }
+    if (kinect_set_mode(source, mode) < 0) {
+      set_err("v4l2 S_FMT failed");
+      return -1;
+    }
   }
   stop_flag = 0;
-  if (pthread_create(&th, NULL, bridge_main, NULL) != 0) {
+  if (pthread_create(&th, NULL, use_v2 ? bridge_v2 : bridge_main, NULL) != 0) {
     set_err("bridge thread");
     return -1;
   }
   started = 1;
-  /* wait until running or error */
-  {
-    int i;
-    for (i = 0; i < 40; i++) {
-      int run;
-      pthread_mutex_lock(&mu);
-      run = running;
-      pthread_mutex_unlock(&mu);
-      if (run) return 0;
-      if (err[0] && !run && i > 2) return -1;
-      usleep(50000);
+  /* Kinect 2 color open can take a few seconds. Return as soon as it is up. */
+  spins = use_v2 ? 140 : 40;
+  for (i = 0; i < spins; i++) {
+    int run, failed;
+    pthread_mutex_lock(&mu);
+    run = running;
+    failed = err[0] && !running;
+    pthread_mutex_unlock(&mu);
+    if (run) return 0;
+    if (failed && i > 2) {
+      kinect_bridge_stop();
+      return -1;
     }
+    usleep(50000);
   }
   if (!kinect_bridge_running()) {
     if (!err[0]) set_err("bridge did not start");
+    kinect_bridge_stop();
     return -1;
   }
   return 0;
@@ -231,7 +335,10 @@ void kinect_bridge_stop(void) {
   stop_flag = 1;
   pthread_join(th, NULL);
   started = 0;
+  pthread_mutex_lock(&mu);
   running = 0;
+  sensor = 0;
+  pthread_mutex_unlock(&mu);
   if (fg) {
     fg_destroy(fg);
     fg = NULL;
@@ -244,6 +351,14 @@ int kinect_bridge_running(void) {
   r = running;
   pthread_mutex_unlock(&mu);
   return r;
+}
+
+int kinect_bridge_sensor(void) {
+  int s;
+  pthread_mutex_lock(&mu);
+  s = running ? sensor : 0;
+  pthread_mutex_unlock(&mu);
+  return s;
 }
 
 const char *kinect_bridge_error(void) { return err; }

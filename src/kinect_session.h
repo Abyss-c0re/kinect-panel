@@ -31,7 +31,10 @@ const char *kinect_session_error(void);
 void kinect_session_status_json(char *buf, size_t n);
 
 /* Control socket — IN command / OUT JSON. One owner process.
- * Commands: OFF | START rgb|ir|cloud | STATUS | QUIT | RAISE */
+ * Commands: OFF | START rgb|ir|cloud [v1|v2|both|auto] | ALIGN | ALIGN RESET |
+ *           STATUS | QUIT | RAISE
+ * START with no source keeps the current sensor. rgb/ir + v2 or both opens
+ * the Kinect 2 color or IR camera. Cloud + both fuses both depth streams. */
 int kinect_ctl_path(char *out, size_t n);
 int kinect_ctl_listen(void);
 int kinect_ctl_fd(void);
