@@ -6,6 +6,7 @@
 #include "kinect_fuse.h"
 #include "kinect_ir.h"
 #include "kinect_motor.h"
+#include "kinect_net.h"
 #include "kinect_session.h"
 #include "kinect_v4l.h"
 #include "kinect2_device.h"
@@ -26,15 +27,17 @@
 #define TILT_MAX 30.0
 
 static GtkWidget *win, *status_lbl, *dev_lbl, *preview_img, *preview_ev;
+static GtkWidget *root_box, *view_box, *full_tag;
 static GtkWidget *btn_cam, *btn_preview, *tilt_scale, *tilt_lbl, *keep_above;
 static GtkWidget *ir_frame, *cloud_frame, *tabs;
 static GtkWidget *sc_boost, *sc_bright, *sc_contrast, *sc_gamma, *sc_black, *sc_white;
 static GtkWidget *sc_near, *sc_far, *sc_stride, *sc_dot, *combo_color, *chk_solid;
 static GtkWidget *btn_rgb_w, *btn_ir_w, *btn_cloud_w;
 static GtkWidget *btn_src_auto, *btn_src_v1, *btn_src_v2, *btn_src_both;
+static GtkWidget *chk_share, *peer_entry, *net_lbl;
 static GtkWidget *sc_fg, *lbl_fg;
 static int camera_on, preview_on, closing, snap_busy, bridge_starting;
-static int src_suppress, mode_suppress;
+static int src_suppress, mode_suppress, share_suppress;
 static char align_note[96];
 static volatile sig_atomic_t got_sig;
 static char mode[8] = "RGB";
@@ -45,6 +48,13 @@ static int ir_ui_guard;
 static int drag_orbit;
 static double drag_x, drag_y;
 static float orbit_e = 18.f, orbit_a = -60.f, orbit_d = 3.2f;
+static int view_full, painting;
+static uint8_t *frame_rgb;
+static int frame_w, frame_h, paint_w, paint_h;
+static guint32 arrow_ms, f11_ms;
+static int win_x, win_y, win_w, win_h;
+static guint fs_watch, restore_watch;
+static int fs_queued;
 
 static int is_cloud(void) { return mode[0] == 'C'; }
 static int is_ir(void) { return mode[0] == 'I'; }
@@ -90,24 +100,147 @@ static void refresh_dev(void) {
   gtk_label_set_text(GTK_LABEL(dev_lbl), buf);
 }
 
-static void show_rgb(const uint8_t *rgb, int w, int h) {
+static void refresh_full_tag(void) {
+  char buf[120];
+  const char *mv = is_cloud() ? "Cloud" : is_ir() ? "IR" : "RGB";
+  snprintf(buf, sizeof buf, "%s  ·  %s     ←→ camera    ↑↓ mode    F11", mv, sensor_word());
+  if (full_tag) gtk_label_set_text(GTK_LABEL(full_tag), buf);
+  if (win && view_full) {
+    char title[160];
+    snprintf(title, sizeof title, "Kinect Panel — %s · %s", mv, sensor_word());
+    gtk_window_set_title(GTK_WINDOW(win), title);
+  }
+}
+
+static gboolean on_img_draw(GtkWidget *w, cairo_t *cr, gpointer u) {
   GdkPixbuf *pb, *sc;
   uint8_t *pix;
-  int row;
-  pb = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, w, h);
-  if (!pb) return;
+  int row, y, aw, ah, dw, dh;
+  double s, ox, oy;
+  (void)u;
+  /* Full screen draws here. A pixbuf on the image would become its minimum
+     size and the panel could not shrink back after Escape. */
+  if (!view_full) return FALSE;
+  aw = gtk_widget_get_allocated_width(w);
+  ah = gtk_widget_get_allocated_height(w);
+  cairo_set_source_rgb(cr, 0, 0, 0);
+  cairo_paint(cr);
+  if (!frame_rgb || frame_w < 1 || frame_h < 1 || aw < 2 || ah < 2) return TRUE;
+  s = (double)aw / (double)frame_w;
+  if ((double)ah / (double)frame_h < s) s = (double)ah / (double)frame_h;
+  dw = (int)(frame_w * s + 0.5);
+  dh = (int)(frame_h * s + 0.5);
+  if (dw < 1) dw = 1;
+  if (dh < 1) dh = 1;
+  if (dw > aw) dw = aw;
+  if (dh > ah) dh = ah;
+  pb = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, frame_w, frame_h);
+  if (!pb) return TRUE;
   pix = gdk_pixbuf_get_pixels(pb);
   row = gdk_pixbuf_get_rowstride(pb);
-  if (row == w * 3)
-    memcpy(pix, rgb, (size_t)w * (size_t)h * 3);
+  if (row == frame_w * 3)
+    memcpy(pix, frame_rgb, (size_t)frame_w * (size_t)frame_h * 3);
   else {
-    int y;
-    for (y = 0; y < h; y++) memcpy(pix + y * row, rgb + y * w * 3, (size_t)w * 3);
+    for (y = 0; y < frame_h; y++)
+      memcpy(pix + (size_t)y * row, frame_rgb + (size_t)y * frame_w * 3, (size_t)frame_w * 3);
   }
-  sc = gdk_pixbuf_scale_simple(pb, 460, 240, GDK_INTERP_NEAREST);
-  gtk_image_set_from_pixbuf(GTK_IMAGE(preview_img), sc);
-  g_object_unref(sc);
+  sc = gdk_pixbuf_scale_simple(pb, dw, dh, GDK_INTERP_NEAREST);
   g_object_unref(pb);
+  if (!sc) return TRUE;
+  ox = (aw - dw) / 2.0;
+  oy = (ah - dh) / 2.0;
+  gdk_cairo_set_source_pixbuf(cr, sc, ox, oy);
+  cairo_paint(cr);
+  g_object_unref(sc);
+  return TRUE;
+}
+
+static void paint_preview(void) {
+  GdkPixbuf *pb, *sc;
+  uint8_t *pix;
+  int row, y, dw, dh;
+  if (painting || !preview_img || !frame_rgb || frame_w < 1 || frame_h < 1) return;
+  if (view_full) {
+    gtk_image_clear(GTK_IMAGE(preview_img));
+    gtk_widget_set_size_request(preview_img, 460, 240);
+    gtk_widget_queue_draw(preview_img);
+    return;
+  }
+  painting = 1;
+  dw = 460;
+  dh = 240;
+  if (view_full && preview_ev) {
+    int aw = gtk_widget_get_allocated_width(preview_ev);
+    int ah = gtk_widget_get_allocated_height(preview_ev);
+    if (aw > 32 && ah > 32) {
+      double s = (double)aw / (double)frame_w;
+      double sy = (double)ah / (double)frame_h;
+      if (sy < s) s = sy;
+      dw = (int)(frame_w * s + 0.5);
+      dh = (int)(frame_h * s + 0.5);
+      if (dw < 1) dw = 1;
+      if (dh < 1) dh = 1;
+    }
+  }
+  pb = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, frame_w, frame_h);
+  if (!pb) {
+    painting = 0;
+    return;
+  }
+  pix = gdk_pixbuf_get_pixels(pb);
+  row = gdk_pixbuf_get_rowstride(pb);
+  if (row == frame_w * 3)
+    memcpy(pix, frame_rgb, (size_t)frame_w * (size_t)frame_h * 3);
+  else {
+    for (y = 0; y < frame_h; y++)
+      memcpy(pix + y * row, frame_rgb + y * frame_w * 3, (size_t)frame_w * 3);
+  }
+  sc = gdk_pixbuf_scale_simple(pb, dw, dh, GDK_INTERP_NEAREST);
+  paint_w = dw;
+  paint_h = dh;
+  if (sc) {
+    gtk_image_set_from_pixbuf(GTK_IMAGE(preview_img), sc);
+    g_object_unref(sc);
+  }
+  g_object_unref(pb);
+  painting = 0;
+}
+
+static void show_rgb(const uint8_t *rgb, int w, int h) {
+  size_t n;
+  uint8_t *p;
+  if (!rgb || w < 1 || h < 1) return;
+  n = (size_t)w * (size_t)h * 3;
+  p = (uint8_t *)realloc(frame_rgb, n);
+  if (!p) return;
+  frame_rgb = p;
+  memcpy(frame_rgb, rgb, n);
+  frame_w = w;
+  frame_h = h;
+  paint_w = 0;
+  paint_h = 0;
+  paint_preview();
+}
+
+static void enter_view_full(void);
+static void leave_view_full(void);
+
+static void on_preview_size(GtkWidget *w, GdkRectangle *a, gpointer u) {
+  int dw, dh;
+  (void)w;
+  (void)u;
+  if (painting || !view_full || !frame_rgb || !a || frame_w < 1 || frame_h < 1) return;
+  dw = 460;
+  dh = 240;
+  if (a->width > 32 && a->height > 32) {
+    double s = (double)a->width / (double)frame_w;
+    double sy = (double)a->height / (double)frame_h;
+    if (sy < s) s = sy;
+    dw = (int)(frame_w * s + 0.5);
+    dh = (int)(frame_h * s + 0.5);
+  }
+  if (dw == paint_w && dh == paint_h) return;
+  paint_preview();
 }
 
 static gboolean apply_preview(gpointer data) {
@@ -419,6 +552,60 @@ static void on_align_reset(GtkButton *b, gpointer u) {
   kinect_fuse_reset_rigid();
   snprintf(align_note, sizeof align_note, "identity");
   set_status("Align reset · identity");
+}
+
+static void on_share_toggled(GtkToggleButton *b, gpointer u) {
+  (void)u;
+  if (share_suppress) return;
+  if (!gtk_toggle_button_get_active(b)) {
+    kinect_net_stop();
+    if (net_lbl) gtk_label_set_text(GTK_LABEL(net_lbl), "Net off");
+    set_status("Share off");
+    return;
+  }
+  if (kinect_net_listen(0) != 0) {
+    const char *e = kinect_net_error();
+    set_status(e && e[0] ? e : "Share failed");
+    share_suppress = 1;
+    gtk_toggle_button_set_active(b, FALSE);
+    share_suppress = 0;
+    return;
+  }
+  set_status("Sharing Kinect on UDP 8765");
+}
+
+static void on_net_connect(GtkButton *b, gpointer u) {
+  const char *t = peer_entry ? gtk_entry_get_text(GTK_ENTRY(peer_entry)) : "";
+  const char *peer = (t && t[0]) ? t : getenv("KINECT_PEER");
+  (void)b;
+  (void)u;
+  if (!peer || !peer[0]) {
+    set_status("Connect needs a host");
+    return;
+  }
+  if (kinect_net_connect(peer) != 0) {
+    const char *e = kinect_net_error();
+    set_status(e && e[0] ? e : "Connect failed");
+    return;
+  }
+  set_status("Connecting to peer…");
+}
+
+static gboolean net_tick(gpointer u) {
+  char line[96];
+  (void)u;
+  if (closing || !net_lbl) return TRUE;
+  kinect_net_status(line, sizeof line);
+  gtk_label_set_text(GTK_LABEL(net_lbl), line);
+  if (chk_share) {
+    int on = kinect_net_listen_port() > 0;
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(chk_share)) != on) {
+      share_suppress = 1;
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chk_share), on);
+      share_suppress = 0;
+    }
+  }
+  return TRUE;
 }
 
 static void on_mode(GtkToggleButton *b, gpointer u) {
@@ -738,6 +925,219 @@ static gboolean preview_tick(gpointer u) {
   return TRUE;
 }
 
+static void cycle_sensor(int dir) {
+  static const kinect_src order[] = {KINECT_SRC_AUTO, KINECT_SRC_V1, KINECT_SRC_V2,
+                                     KINECT_SRC_BOTH};
+  kinect_src cur = kinect_fuse_source();
+  int at = 0, i;
+  GtkWidget *b;
+  for (i = 0; i < 4; i++)
+    if (order[i] == cur) at = i;
+  at = (at + (dir < 0 ? 3 : 1)) % 4;
+  b = src_radio_for(order[at]);
+  if (b) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(b), TRUE);
+  refresh_full_tag();
+}
+
+static void cycle_mode(int dir) {
+  GtkWidget *order[3];
+  int at = 0;
+  order[0] = btn_rgb_w;
+  order[1] = btn_ir_w;
+  order[2] = btn_cloud_w;
+  if (is_ir()) at = 1;
+  else if (is_cloud()) at = 2;
+  at = (at + (dir < 0 ? 2 : 1)) % 3;
+  if (order[at]) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(order[at]), TRUE);
+  refresh_full_tag();
+}
+
+/* KWin ignores _NET_WM_STATE_FULLSCREEN on a utility window that stays on top.
+   Withdraw, switch to a normal window, then ask again. If the atom still does
+   not stick, cover the monitor so the view fills the screen anyway. */
+static void cover_monitor(void) {
+  GdkDisplay *d;
+  GdkWindow *gw;
+  GdkMonitor *mon = NULL;
+  GdkRectangle geo;
+  if (!win) return;
+  d = gtk_widget_get_display(win);
+  gw = gtk_widget_get_window(win);
+  if (d && gw) mon = gdk_display_get_monitor_at_window(d, gw);
+  if (!mon && d) mon = gdk_display_get_primary_monitor(d);
+  if (!mon && d) mon = gdk_display_get_monitor(d, 0);
+  if (!mon) return;
+  gdk_monitor_get_geometry(mon, &geo);
+  if (geo.width < 64 || geo.height < 64) return;
+  gtk_window_move(GTK_WINDOW(win), geo.x, geo.y);
+  gtk_window_resize(GTK_WINDOW(win), geo.width, geo.height);
+}
+
+static gboolean fullscreen_stuck(gpointer u) {
+  GdkWindow *gw;
+  (void)u;
+  fs_watch = 0;
+  if (!view_full || !win) return G_SOURCE_REMOVE;
+  gw = gtk_widget_get_window(win);
+  if (gw && (gdk_window_get_state(gw) & GDK_WINDOW_STATE_FULLSCREEN)) {
+    paint_w = 0;
+    paint_h = 0;
+    if (preview_img) gtk_widget_queue_draw(preview_img);
+    return G_SOURCE_REMOVE;
+  }
+  gtk_window_fullscreen(GTK_WINDOW(win));
+  cover_monitor();
+  paint_w = 0;
+  paint_h = 0;
+  paint_preview();
+  return G_SOURCE_REMOVE;
+}
+
+static void enter_view_full(void) {
+  if (view_full || !win || !preview_ev || !view_box || !root_box) return;
+  gtk_window_get_position(GTK_WINDOW(win), &win_x, &win_y);
+  gtk_window_get_size(GTK_WINDOW(win), &win_w, &win_h);
+  g_object_ref(preview_ev);
+  gtk_container_remove(GTK_CONTAINER(view_box), preview_ev);
+  g_object_ref(root_box);
+  gtk_container_remove(GTK_CONTAINER(win), root_box);
+  gtk_container_set_border_width(GTK_CONTAINER(win), 0);
+  gtk_container_add(GTK_CONTAINER(win), preview_ev);
+  g_object_unref(preview_ev);
+  view_full = 1;
+  refresh_full_tag();
+  if (full_tag) gtk_widget_show(full_tag);
+  gtk_widget_set_can_focus(preview_ev, TRUE);
+  gtk_widget_set_hexpand(preview_ev, TRUE);
+  gtk_widget_set_vexpand(preview_ev, TRUE);
+  gtk_widget_set_hexpand(preview_img, TRUE);
+  gtk_widget_set_vexpand(preview_img, TRUE);
+  gtk_widget_set_halign(preview_img, GTK_ALIGN_FILL);
+  gtk_widget_set_valign(preview_img, GTK_ALIGN_FILL);
+  if (restore_watch) {
+    g_source_remove(restore_watch);
+    restore_watch = 0;
+  }
+  gtk_window_set_keep_above(GTK_WINDOW(win), FALSE);
+  gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
+  gtk_widget_hide(win);
+  gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_NORMAL);
+  gtk_widget_show(win);
+  gtk_window_fullscreen(GTK_WINDOW(win));
+  gtk_window_present(GTK_WINDOW(win));
+  gtk_widget_grab_focus(preview_ev);
+  paint_w = 0;
+  paint_h = 0;
+  paint_preview();
+  if (fs_watch) g_source_remove(fs_watch);
+  fs_watch = g_timeout_add(400, fullscreen_stuck, NULL);
+}
+
+static void apply_windowed_geom(void) {
+  if (!win || view_full || win_w < 1 || win_h < 1) return;
+  gtk_window_unmaximize(GTK_WINDOW(win));
+  gtk_window_move(GTK_WINDOW(win), win_x, win_y);
+  gtk_window_resize(GTK_WINDOW(win), win_w, win_h);
+}
+
+static gboolean restore_windowed_size(gpointer u) {
+  (void)u;
+  restore_watch = 0;
+  apply_windowed_geom();
+  return G_SOURCE_REMOVE;
+}
+
+static void leave_view_full(void) {
+  int above;
+  if (!view_full || !win || !preview_ev || !view_box || !root_box) return;
+  if (fs_watch) {
+    g_source_remove(fs_watch);
+    fs_watch = 0;
+  }
+  view_full = 0;
+  gtk_window_unfullscreen(GTK_WINDOW(win));
+  gtk_window_unmaximize(GTK_WINDOW(win));
+  if (full_tag) gtk_widget_hide(full_tag);
+  gtk_widget_set_can_focus(preview_ev, FALSE);
+  gtk_widget_set_hexpand(preview_img, FALSE);
+  gtk_widget_set_vexpand(preview_img, FALSE);
+  gtk_widget_set_halign(preview_img, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign(preview_img, GTK_ALIGN_CENTER);
+  gtk_widget_set_size_request(preview_img, 460, 240);
+  g_object_ref(preview_ev);
+  gtk_container_remove(GTK_CONTAINER(win), preview_ev);
+  gtk_container_add(GTK_CONTAINER(win), root_box);
+  g_object_unref(root_box);
+  gtk_box_pack_start(GTK_BOX(view_box), preview_ev, TRUE, TRUE, 0);
+  gtk_box_reorder_child(GTK_BOX(view_box), preview_ev, 0);
+  g_object_unref(preview_ev);
+  gtk_container_set_border_width(GTK_CONTAINER(win), 10);
+  above = keep_above && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keep_above));
+  paint_w = 0;
+  paint_h = 0;
+  paint_preview();
+  gtk_widget_hide(win);
+  gtk_window_set_decorated(GTK_WINDOW(win), TRUE);
+  gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_UTILITY);
+  gtk_widget_show_all(win);
+  if (full_tag) gtk_widget_hide(full_tag);
+  if (above) gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
+  gtk_window_set_title(GTK_WINDOW(win), "Kinect Panel");
+  apply_windowed_geom();
+  if (restore_watch) g_source_remove(restore_watch);
+  restore_watch = g_timeout_add(250, restore_windowed_size, NULL);
+  if (btn_cam) gtk_widget_grab_focus(btn_cam);
+}
+
+static gboolean fs_idle(gpointer u) {
+  int op = fs_queued;
+  (void)u;
+  fs_queued = 0;
+  if (op == 1)
+    enter_view_full();
+  else if (op == 2)
+    leave_view_full();
+  return G_SOURCE_REMOVE;
+}
+
+/* Reparent after the key event returns. Doing it inside the handler removes
+   the widget that is still on the emission stack. */
+static void queue_fs(int enter) {
+  if (fs_queued == 0) g_idle_add(fs_idle, NULL);
+  fs_queued = enter ? 1 : 2;
+}
+
+static gboolean on_key(GtkWidget *w, GdkEventKey *e, gpointer u) {
+  (void)w;
+  (void)u;
+  if (!e) return FALSE;
+  if (e->keyval == GDK_KEY_F11) {
+    if (e->time && f11_ms && e->time - f11_ms < 400) return TRUE;
+    f11_ms = e->time;
+    queue_fs(!view_full);
+    return TRUE;
+  }
+  if (!view_full) return FALSE;
+  if (e->keyval == GDK_KEY_Escape) {
+    queue_fs(0);
+    return TRUE;
+  }
+  if (e->keyval != GDK_KEY_Left && e->keyval != GDK_KEY_Right && e->keyval != GDK_KEY_Up &&
+      e->keyval != GDK_KEY_Down)
+    return FALSE;
+  if (arrow_ms && e->time - arrow_ms < 220) return TRUE;
+  arrow_ms = e->time;
+  if (e->keyval == GDK_KEY_Left)
+    cycle_sensor(-1);
+  else if (e->keyval == GDK_KEY_Right)
+    cycle_sensor(1);
+  else if (e->keyval == GDK_KEY_Up)
+    cycle_mode(-1);
+  else
+    cycle_mode(1);
+  return TRUE;
+}
+
 static gboolean on_delete(GtkWidget *w, GdkEvent *e, gpointer u) {
   (void)w;
   (void)e;
@@ -826,12 +1226,20 @@ static void cleanup(void) {
   }
   closing = 1;
   kinect_session_off();
+  kinect_net_stop();
   kinect_ctl_close();
 }
 
 static void on_destroy(GtkWidget *w, gpointer u) {
   (void)w;
   (void)u;
+  free(frame_rgb);
+  frame_rgb = NULL;
+  if (view_full && root_box) {
+    g_object_unref(root_box);
+    root_box = NULL;
+    view_full = 0;
+  }
   cleanup();
   gtk_main_quit();
 }
@@ -939,8 +1347,12 @@ static void usage(void) {
       "  --status                          JSON SoT line (does not touch USB)\n"
       "  --quit                            stop the owner process\n"
       "  --help\n"
+      "GUI: F11 full screen of the RGB, IR, or cloud view. Esc or F11 leaves.\n"
+      "     Full screen arrows: left/right camera, up/down mode.\n"
+      "     Share listens on UDP 8765. Connect uses the peer as a local sensor.\n"
       "Socket: START cloud [v1|v2|both|auto]  |  ALIGN  |  ALIGN RESET\n"
-      "Env: KINECT_SRC  KINECT2_PIPELINE=cpu|cl|gl|clkde  KINECT_EXTRINSIC\n",
+      "        SHARE  |  CONNECT host[:port]  |  NET OFF\n"
+      "Env: KINECT_SRC  KINECT_PEER  KINECT_SHARE_PORT  KINECT2_PIPELINE  KINECT_EXTRINSIC\n",
       stdout);
 }
 
@@ -1086,26 +1498,65 @@ int main(int argc, char **argv) {
   g_signal_connect(win, "destroy", G_CALLBACK(on_destroy), NULL);
 
   root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  root_box = root;
   gtk_container_add(GTK_CONTAINER(win), root);
+  g_signal_connect(win, "key-press-event", G_CALLBACK(on_key), NULL);
 
   status_lbl = gtk_label_new("Starting…");
   gtk_label_set_xalign(GTK_LABEL(status_lbl), 0);
   gtk_label_set_line_wrap(GTK_LABEL(status_lbl), TRUE);
   gtk_box_pack_start(GTK_BOX(root), status_lbl, FALSE, FALSE, 0);
 
-  frame = gtk_frame_new("View  (RGB / IR / Cloud)");
+  frame = gtk_frame_new("View  (RGB / IR / Cloud)   F11");
   box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+  view_box = box;
   gtk_container_set_border_width(GTK_CONTAINER(box), 4);
   preview_ev = gtk_event_box_new();
+  gtk_widget_set_name(preview_ev, "kinect-preview");
   gtk_widget_add_events(preview_ev, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
-                                         GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK);
-  preview_img = gtk_image_new();
-  gtk_widget_set_size_request(preview_img, 460, 240);
-  gtk_container_add(GTK_CONTAINER(preview_ev), preview_img);
+                                         GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK |
+                                         GDK_KEY_PRESS_MASK);
+  {
+    GtkWidget *overlay = gtk_overlay_new();
+    GtkCssProvider *css = gtk_css_provider_new();
+    preview_img = gtk_image_new();
+    gtk_widget_set_size_request(preview_img, 460, 240);
+    gtk_widget_set_halign(preview_img, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(preview_img, GTK_ALIGN_CENTER);
+    g_signal_connect(preview_img, "draw", G_CALLBACK(on_img_draw), NULL);
+    gtk_container_add(GTK_CONTAINER(overlay), preview_img);
+    full_tag = gtk_label_new("");
+    gtk_widget_set_halign(full_tag, GTK_ALIGN_START);
+    gtk_widget_set_valign(full_tag, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(full_tag, 16);
+    gtk_widget_set_margin_top(full_tag, 12);
+    gtk_style_context_add_class(gtk_widget_get_style_context(full_tag), "kinect-fulltag");
+    gtk_widget_set_no_show_all(full_tag, TRUE);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), full_tag);
+    gtk_container_add(GTK_CONTAINER(preview_ev), overlay);
+    gtk_css_provider_load_from_data(
+        css,
+        "#kinect-preview, #kinect-preview * { background-color: #000000; }\n"
+        "label.kinect-fulltag { background-color: rgba(0,0,0,0.72); color: #ffffff;"
+        " padding: 8px 12px; }\n",
+        -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(preview_ev),
+                                   GTK_STYLE_PROVIDER(css),
+                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(full_tag),
+                                   GTK_STYLE_PROVIDER(css),
+                                   GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
+  }
+  gtk_widget_set_tooltip_text(preview_ev,
+                              "F11: full screen of this view. There, left/right changes camera "
+                              "and up/down changes RGB, IR, or Cloud.");
   g_signal_connect(preview_ev, "button-press-event", G_CALLBACK(on_orbit_press), NULL);
   g_signal_connect(preview_ev, "button-release-event", G_CALLBACK(on_orbit_release), NULL);
   g_signal_connect(preview_ev, "motion-notify-event", G_CALLBACK(on_orbit_motion), NULL);
   g_signal_connect(preview_ev, "scroll-event", G_CALLBACK(on_orbit_scroll), NULL);
+  g_signal_connect(preview_ev, "key-press-event", G_CALLBACK(on_key), NULL);
+  g_signal_connect(preview_ev, "size-allocate", G_CALLBACK(on_preview_size), NULL);
   gtk_box_pack_start(GTK_BOX(box), preview_ev, TRUE, TRUE, 0);
   row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   btn_preview = gtk_toggle_button_new_with_label("Preview OFF");
@@ -1189,6 +1640,27 @@ int main(int argc, char **argv) {
     gtk_label_set_xalign(GTK_LABEL(hint), 0);
     gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
     gtk_box_pack_start(GTK_BOX(sb), hint, FALSE, FALSE, 0);
+    {
+      GtkWidget *nrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+      GtkWidget *go = gtk_button_new_with_label("Connect");
+      const char *env_peer = getenv("KINECT_PEER");
+      chk_share = gtk_check_button_new_with_label("Share");
+      peer_entry = gtk_entry_new();
+      gtk_entry_set_width_chars(GTK_ENTRY(peer_entry), 18);
+      gtk_entry_set_placeholder_text(GTK_ENTRY(peer_entry), "host:8765");
+      if (env_peer && env_peer[0]) gtk_entry_set_text(GTK_ENTRY(peer_entry), env_peer);
+      net_lbl = gtk_label_new("Net off");
+      gtk_label_set_xalign(GTK_LABEL(net_lbl), 0);
+      g_signal_connect(chk_share, "toggled", G_CALLBACK(on_share_toggled), NULL);
+      g_signal_connect(go, "clicked", G_CALLBACK(on_net_connect), NULL);
+      gtk_widget_set_tooltip_text(chk_share, "Listen on UDP 8765. Does not open a camera.");
+      gtk_widget_set_tooltip_text(go, "Use this host's Kinect as a local sensor.");
+      gtk_box_pack_start(GTK_BOX(nrow), chk_share, FALSE, FALSE, 0);
+      gtk_box_pack_start(GTK_BOX(nrow), peer_entry, TRUE, TRUE, 0);
+      gtk_box_pack_start(GTK_BOX(nrow), go, FALSE, FALSE, 0);
+      gtk_box_pack_start(GTK_BOX(sb), nrow, FALSE, FALSE, 0);
+      gtk_box_pack_start(GTK_BOX(sb), net_lbl, FALSE, FALSE, 0);
+    }
     gtk_box_pack_start(GTK_BOX(cam_page), sf, FALSE, FALSE, 0);
   }
   /* Preview stays under the mode buttons so a live frame cannot cover them. */
@@ -1348,6 +1820,7 @@ int main(int argc, char **argv) {
   g_timeout_add(250, poll_tilt, NULL);
   g_timeout_add(200, preview_tick, NULL);
   g_timeout_add(200, sig_tick, NULL);
+  g_timeout_add(500, net_tick, NULL);
   g_idle_add(boot, NULL);
   {
     /* Logical screen is often half the pixel size. A fixed 860px window falls off it. */

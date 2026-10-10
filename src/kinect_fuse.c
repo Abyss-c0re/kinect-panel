@@ -6,6 +6,7 @@
  * v1 camera, which is the cloud the panel and OpenXR already use. */
 #include "kinect_fuse.h"
 #include "kinect2_device.h"
+#include "kinect_net.h"
 
 #include <libfreenect.h>
 #include <pthread.h>
@@ -53,6 +54,12 @@ static int have_pending, last_tilt_st;
 static char err[160];
 static kinect_fuse_stats stats;
 static uint32_t seq;
+static int remote1, remote2;
+static int local_v1_usb;
+static uint16_t *net_u16;
+static float *wire_mm;
+static float *remote_m;
+static uint64_t last_offer2_us;
 
 static uint64_t mono_us(void) {
   struct timespec ts;
@@ -228,7 +235,10 @@ static int alloc_rings(void) {
   int i;
   cb_depth = (uint16_t *)calloc(V1_N, sizeof(uint16_t));
   pub_depth = (uint16_t *)calloc(V1_N, sizeof(uint16_t));
-  if (!cb_depth || !pub_depth) return -1;
+  net_u16 = (uint16_t *)calloc(V1_N, sizeof(uint16_t));
+  wire_mm = (float *)calloc(KINECT2_N, sizeof(float));
+  remote_m = (float *)calloc(KINECT2_N, sizeof(float));
+  if (!cb_depth || !pub_depth || !net_u16 || !wire_mm || !remote_m) return -1;
   for (i = 0; i < RING; i++) {
     ring1[i] = (uint16_t *)calloc(V1_N, sizeof(uint16_t));
     ring2[i] = (float *)calloc(KINECT2_N, sizeof(float));
@@ -241,7 +251,11 @@ static void free_rings(void) {
   int i;
   free(cb_depth);
   free(pub_depth);
-  cb_depth = pub_depth = NULL;
+  free(net_u16);
+  free(wire_mm);
+  free(remote_m);
+  cb_depth = pub_depth = net_u16 = NULL;
+  wire_mm = remote_m = NULL;
   for (i = 0; i < RING; i++) {
     free(ring1[i]);
     free(ring2[i]);
@@ -294,97 +308,213 @@ static int open_all(void) {
     cube_cloud_init(&sens2);
     clouds_ready = 1;
   }
-  if (req == KINECT_SRC_V2)
-    have1 = 0;
-  else
-    have1 = probe_v1();
-  if (stop_flag) return -1;
-  if (req == KINECT_SRC_V1)
-    have2 = 0;
-  else
-    have2 = kinect2_count();
-  if (stop_flag) return -1;
-
-  use = req;
-  if (req == KINECT_SRC_AUTO) {
-    if (have1 && have2)
-      use = KINECT_SRC_BOTH;
-    else if (have2)
-      use = KINECT_SRC_V2;
-    else if (have1)
-      use = KINECT_SRC_V1;
-    else {
+  {
+    int local1 = 0, local2 = 0, peer = 0, spins = 0, max_spins = 0;
+    if (req != KINECT_SRC_V2) local1 = probe_v1() > 0;
+    if (stop_flag) return -1;
+    if (req != KINECT_SRC_V1) local2 = kinect2_count() > 0;
+    if (stop_flag) return -1;
+    kinect_net_set_local((local1 ? 1 : 0) | (local2 ? 2 : 0));
+    if (kinect_net_active()) {
+      int need = 0;
+      if (req == KINECT_SRC_BOTH && (!local1 || !local2)) {
+        need = 1;
+        /* Local depth can start at once. A missing sensor is filled when the
+         * peer connects. With nothing local, wait longer for that peer. */
+        max_spins = (local1 || local2) ? 10 : 160;
+      } else if (req == KINECT_SRC_V1 && !local1) {
+        need = 1;
+        max_spins = 60;
+      } else if (req == KINECT_SRC_V2 && !local2) {
+        need = 1;
+        max_spins = 60;
+      } else if (req == KINECT_SRC_AUTO && !(local1 && local2)) {
+        need = 1;
+        max_spins = 20;
+      }
+      if (need) {
+        while (spins < max_spins && !stop_flag) {
+          int h1, h2;
+          peer = kinect_net_peer_sensors();
+          h1 = local1 || (peer & 1);
+          h2 = local2 || (peer & 2);
+          if (req == KINECT_SRC_BOTH && h1 && h2) break;
+          if (req == KINECT_SRC_V1 && h1) break;
+          if (req == KINECT_SRC_V2 && h2) break;
+          if (req == KINECT_SRC_AUTO && h1 && h2) break;
+          if (req == KINECT_SRC_AUTO && !kinect_net_connected() && spins >= 6 && (local1 || local2))
+            break;
+          usleep(50000);
+          spins++;
+        }
+        peer = kinect_net_peer_sensors();
+      }
+    }
+    if (req != KINECT_SRC_V2) have1 = local1 || (peer & 1);
+    if (req != KINECT_SRC_V1) have2 = local2 || (peer & 2);
+    use = req;
+    if (req == KINECT_SRC_AUTO) {
+      if (have1 && have2)
+        use = KINECT_SRC_BOTH;
+      else if (have2)
+        use = KINECT_SRC_V2;
+      else if (have1)
+        use = KINECT_SRC_V1;
+      else {
+        set_err("no kinect");
+        return -1;
+      }
+    } else if (req == KINECT_SRC_V1 && !have1) {
       set_err("no kinect");
       return -1;
-    }
-  } else if (req == KINECT_SRC_V1 && !have1) {
-    set_err("no kinect");
-    return -1;
-  } else if (req == KINECT_SRC_V2 && !have2) {
-    set_err(kinect2_error()[0] ? kinect2_error() : "no kinect 2");
-    return -1;
-  } else if (req == KINECT_SRC_BOTH && (!have1 || !have2)) {
-    set_err("need kinect and kinect 2");
-    return -1;
-  }
-
-  if (use == KINECT_SRC_V1 || use == KINECT_SRC_BOTH) {
-    if (open_v1() != 0) {
-      if (req == KINECT_SRC_AUTO && have2) {
-        set_err("");
-        use = KINECT_SRC_V2;
-      } else
-        return -1;
-    }
-  }
-  if (stop_flag) return -1;
-  if (use == KINECT_SRC_V2 || use == KINECT_SRC_BOTH) {
-    if (kinect2_open() != 0) {
-      if (req == KINECT_SRC_AUTO && dev) {
-        set_err("kinect 2 failed — kinect only");
-        use = KINECT_SRC_V1;
-      } else {
-        if (!err[0]) set_err(kinect2_error()[0] ? kinect2_error() : "kinect 2 open failed");
+    } else if (req == KINECT_SRC_V2 && !have2) {
+      set_err(kinect2_error()[0] ? kinect2_error() : "no kinect 2");
+      return -1;
+    } else if (req == KINECT_SRC_BOTH && (!have1 || !have2)) {
+      /* Share stays up on the local camera until the other Kinect appears. */
+      if (!(kinect_net_active() && (local1 || local2 || have1 || have2))) {
+        set_err("need kinect and kinect 2");
         return -1;
       }
     }
+    remote1 = (use == KINECT_SRC_V1 || use == KINECT_SRC_BOTH) && !local1;
+    remote2 = (use == KINECT_SRC_V2 || use == KINECT_SRC_BOTH) && !local2;
+    if ((use == KINECT_SRC_V1 || use == KINECT_SRC_BOTH) && local1) {
+      if (open_v1() != 0) {
+        if ((peer & 1) && req != KINECT_SRC_V2) {
+          remote1 = 1;
+          set_err("");
+        } else if (req == KINECT_SRC_AUTO && (local2 || (peer & 2))) {
+          remote1 = 0;
+          use = KINECT_SRC_V2;
+          set_err("");
+        } else
+          return -1;
+      }
+    }
+    if (stop_flag) return -1;
+    if ((use == KINECT_SRC_V2 || use == KINECT_SRC_BOTH) && local2) {
+      if (kinect2_open() != 0) {
+        if ((peer & 2) && req != KINECT_SRC_V1) {
+          remote2 = 1;
+          set_err("");
+        } else if (req == KINECT_SRC_AUTO && (dev || remote1)) {
+          remote2 = 0;
+          use = (dev || remote1) ? KINECT_SRC_V1 : use;
+          set_err("kinect 2 failed — kinect only");
+        } else {
+          if (!err[0]) set_err(kinect2_error()[0] ? kinect2_error() : "kinect 2 open failed");
+          return -1;
+        }
+      }
+    }
   }
-  if (!dev && !kinect2_is_open()) {
-    if (!err[0]) set_err("no depth device");
-    return -1;
+  {
+    int up1 = (dev != NULL) || remote1;
+    int up2 = kinect2_is_open() || remote2;
+    if (!up1 && !up2) {
+      if (!err[0]) set_err("no depth device");
+      return -1;
+    }
+    if (req == KINECT_SRC_BOTH && (!up1 || !up2) && !kinect_net_active()) {
+      set_err("need kinect and kinect 2");
+      return -1;
+    }
+    if (up1 && up2)
+      use = KINECT_SRC_BOTH;
+    else if (up2)
+      use = KINECT_SRC_V2;
+    else
+      use = KINECT_SRC_V1;
+    pthread_mutex_lock(&mu);
+    active = use;
+    local_v1_usb = dev != NULL;
+    stats.requested = req;
+    stats.active = use;
+    stats.v1_open = up1;
+    stats.v2_open = up2;
+    stats.running = 1;
+    stats.skew_us = -1;
+    stats.paired = 0;
+    stats.identity_rigid = ksync_rigid_is_identity(&rigid);
+    snprintf(stats.pipeline, sizeof stats.pipeline, "%s", up2 && !remote2 ? kinect2_pipeline() : "");
+    pthread_mutex_unlock(&mu);
   }
-  if (dev && kinect2_is_open()) {
-    use = KINECT_SRC_BOTH;
-    set_err("");
-  } else if (kinect2_is_open())
-    use = KINECT_SRC_V2;
-  else
-    use = KINECT_SRC_V1;
-  pthread_mutex_lock(&mu);
-  active = use;
-  stats.requested = req;
-  stats.active = use;
-  stats.v1_open = dev != NULL;
-  stats.v2_open = kinect2_is_open();
-  stats.running = 1;
-  stats.skew_us = -1;
-  stats.paired = 0;
-  stats.identity_rigid = ksync_rigid_is_identity(&rigid);
-  snprintf(stats.pipeline, sizeof stats.pipeline, "%s", kinect2_pipeline());
-  pthread_mutex_unlock(&mu);
   return 0;
 }
 
 static void close_all(void) {
   kinect2_close();
   close_v1();
+  remote1 = remote2 = 0;
   free_rings();
   pthread_mutex_lock(&mu);
+  local_v1_usb = 0;
   stats.running = 0;
   stats.v1_open = 0;
   stats.v2_open = 0;
   stats.paired = 0;
   pthread_mutex_unlock(&mu);
+}
+
+static void note_sources(void) {
+  int up1 = (dev != NULL) || remote1;
+  int up2 = kinect2_is_open() || remote2;
+  kinect_src use;
+  if (up1 && up2)
+    use = KINECT_SRC_BOTH;
+  else if (up2)
+    use = KINECT_SRC_V2;
+  else if (up1)
+    use = KINECT_SRC_V1;
+  else
+    use = active;
+  pthread_mutex_lock(&mu);
+  active = use;
+  local_v1_usb = dev != NULL;
+  stats.active = use;
+  stats.v1_open = up1;
+  stats.v2_open = up2;
+  pthread_mutex_unlock(&mu);
+}
+
+static void adopt_peer(void) {
+  kinect_src req;
+  int peer;
+  if (!kinect_net_active()) return;
+  peer = kinect_net_peer_sensors();
+  if (!peer) return;
+  pthread_mutex_lock(&mu);
+  req = want_src;
+  pthread_mutex_unlock(&mu);
+  if (!remote1 && !dev && (peer & 1) && req != KINECT_SRC_V2) remote1 = 1;
+  if (!remote2 && !kinect2_is_open() && (peer & 2) && req != KINECT_SRC_V1) remote2 = 1;
+  note_sources();
+}
+
+static void offer_local_v2(const float *z_mm, uint64_t ts) {
+  float fx, fy, cx, cy;
+  uint64_t now = mono_us();
+  if (!z_mm || now - last_offer2_us < 45000ull) return;
+  last_offer2_us = now;
+  if (kinect2_ir_intrinsics(&fx, &fy, &cx, &cy) == 0)
+    kinect_net_offer_intrinsics(2, fx, fy, cx, cy);
+  if (wire_mm && kinect2_metric_depth(z_mm, wire_mm) == 0)
+    kinect_net_offer_depth(2, wire_mm, KINECT2_W, KINECT2_H, 1, ts);
+  else
+    kinect_net_offer_depth(2, z_mm, KINECT2_W, KINECT2_H, 1, ts);
+}
+
+static int build_remote_v2(cube_cloud *dst, const float *z_mm, const cube_cloud_tune *t, int budget) {
+  float fx, fy, cx, cy;
+  int i;
+  if (!dst || !z_mm || !remote_m) return -1;
+  if (kinect_net_take_intrinsics(2, &fx, &fy, &cx, &cy) != 1) return -1;
+  for (i = 0; i < KINECT2_N; i++) remote_m[i] = z_mm[i] * 0.001f;
+  if (ksync_project_depth(dst, remote_m, KINECT2_W, KINECT2_H, fx, fy, cx, cy, t, budget) != 0)
+    return -1;
+  ksync_tint_v2(dst);
+  return 0;
 }
 
 static void remember(const cube_cloud *merged, const cube_cloud *a, const cube_cloud *b,
@@ -415,9 +545,11 @@ static void pump(void) {
   cube_cloud_init(&merged);
   while (!stop_flag) {
     int fresh1 = 0, fresh2 = 0, dirty, i1, i2, paired = 0, skew = -1;
+    int up1, up2, waited;
     cube_cloud_tune tcopy;
     ksync_rigid rig;
     int budget, guard;
+    adopt_peer();
     if (dev) {
       struct timeval tv = {0, 15000};
       double tilt = 0;
@@ -449,6 +581,22 @@ static void pump(void) {
         fresh1 = 1;
       }
       pthread_mutex_unlock(&cb_mu);
+      if (fresh1) {
+        int prev = (w1 + RING - 1) % RING;
+        kinect_net_offer_depth(1, ring1[prev], V1_W, V1_H, 0, stamp1[prev]);
+      }
+    }
+    if (remote1 && net_u16) {
+      uint64_t ts = 0;
+      uint32_t seqn = 0;
+      int rw = 0, rh = 0;
+      if (kinect_net_take_depth(1, ring1[w1], V1_N, &rw, &rh, &ts, &seqn) == 1 && rw == V1_W &&
+          rh == V1_H) {
+        stamp1[w1] = ts ? ts : mono_us();
+        w1 = (w1 + 1) % RING;
+        if (nring1 < RING) nring1++;
+        fresh1 = 1;
+      }
     }
     if (kinect2_is_open()) {
       guard = 0;
@@ -463,6 +611,25 @@ static void pump(void) {
         fresh2 = 1;
         guard++;
       }
+      if (fresh2) {
+        int prev = (w2 + RING - 1) % RING;
+        offer_local_v2(ring2[prev], stamp2[prev]);
+      }
+    }
+    if (remote2 && net_u16) {
+      uint64_t ts = 0;
+      uint32_t seqn = 0;
+      int rw = 0, rh = 0;
+      if (kinect_net_take_depth(2, net_u16, V1_N, &rw, &rh, &ts, &seqn) == 1 && rw == KINECT2_W &&
+          rh == KINECT2_H) {
+        int pi;
+        float *dst = ring2[w2];
+        for (pi = 0; pi < KINECT2_N; pi++) dst[pi] = net_u16[pi] ? (float)net_u16[pi] : 0.f;
+        stamp2[w2] = ts ? ts : mono_us();
+        w2 = (w2 + 1) % RING;
+        if (nring2 < RING) nring2++;
+        fresh2 = 1;
+      }
     }
     pthread_mutex_lock(&mu);
     dirty = tune_dirty;
@@ -470,11 +637,17 @@ static void pump(void) {
     tcopy = tune;
     rig = rigid;
     pthread_mutex_unlock(&mu);
-    if (!fresh1 && !fresh2 && !dirty) continue;
+    waited = (dev != NULL) || kinect2_is_open();
+    if (!fresh1 && !fresh2 && !dirty) {
+      if (!waited) usleep(4000);
+      continue;
+    }
 
+    up1 = (dev != NULL) || remote1;
+    up2 = kinect2_is_open() || remote2;
     i1 = latest_i(nring1, w1);
     i2 = latest_i(nring2, w2);
-    if (dev && kinect2_is_open() && nring1 > 0 && nring2 > 0) {
+    if (up1 && up2 && nring1 > 0 && nring2 > 0) {
       int a = 0, b = 0;
       uint64_t sk = 0;
       if (ksync_best_pair(stamp1, nring1, stamp2, nring2, mono_us(), &a, &b, &sk) == 0) {
@@ -494,14 +667,16 @@ static void pump(void) {
 
     cube_cloud_clear(&c1);
     cube_cloud_clear(&c2);
-    budget = (dev && kinect2_is_open()) ? CUBE_CLOUD_MAX / 2 : CUBE_CLOUD_MAX;
-    if (dev && i1 >= 0) {
+    budget = (up1 && up2) ? CUBE_CLOUD_MAX / 2 : CUBE_CLOUD_MAX;
+    if (up1 && i1 >= 0) {
       cube_cloud_tune tv = tcopy;
       tv.stride = ksync_cover_stride(V1_W, V1_H, tcopy.stride, budget);
       if (cube_cloud_from_depth_ex(&c1, ring1[i1], &tv) != 0) cube_cloud_clear(&c1);
     }
-    if (kinect2_is_open() && i2 >= 0) {
-      if (kinect2_cloud_from_depth(ring2[i2], &tcopy, &c2, budget) == 0)
+    if (up2 && i2 >= 0) {
+      if (remote2) {
+        if (build_remote_v2(&c2, ring2[i2], &tcopy, budget) != 0) cube_cloud_clear(&c2);
+      } else if (kinect2_cloud_from_depth(ring2[i2], &tcopy, &c2, budget) == 0)
         ksync_tint_v2(&c2);
       else
         cube_cloud_clear(&c2);
@@ -514,7 +689,7 @@ static void pump(void) {
     else if (c2.n > 0)
       cube_cloud_copy(&merged, &c2);
     if (merged.n > 0)
-      remember(&merged, &c1, &c2, (dev && i1 >= 0) ? ring1[i1] : NULL, skew, paired && c1.n && c2.n);
+      remember(&merged, &c1, &c2, (up1 && i1 >= 0) ? ring1[i1] : NULL, skew, paired && c1.n && c2.n);
   }
   cube_cloud_free(&c1);
   cube_cloud_free(&c2);
@@ -748,4 +923,39 @@ void kinect_fuse_get_rigid(ksync_rigid *r) {
   pthread_mutex_lock(&mu);
   *r = rigid;
   pthread_mutex_unlock(&mu);
+}
+
+int kinect_fuse_local_v1(void) {
+  int v;
+  pthread_mutex_lock(&mu);
+  v = local_v1_usb;
+  pthread_mutex_unlock(&mu);
+  return v;
+}
+
+int kinect_fuse_snapshot_parts(cube_cloud *merged, cube_cloud *v1, cube_cloud *v2) {
+  int rc = -1;
+  pthread_mutex_lock(&mu);
+  if (merged) {
+    if (snap.n > 0)
+      rc = cube_cloud_copy(merged, &snap);
+    else
+      rc = -1;
+  } else {
+    rc = (snap.n > 0 || sens1.n > 0 || sens2.n > 0) ? 0 : -1;
+  }
+  if (v1) {
+    if (sens1.n > 0)
+      cube_cloud_copy(v1, &sens1);
+    else
+      cube_cloud_clear(v1);
+  }
+  if (v2) {
+    if (sens2.n > 0)
+      cube_cloud_copy(v2, &sens2);
+    else
+      cube_cloud_clear(v2);
+  }
+  pthread_mutex_unlock(&mu);
+  return rc;
 }

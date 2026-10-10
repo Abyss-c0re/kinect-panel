@@ -37,3 +37,15 @@ int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t, cube_c
   if (out) snprintf(out->err, sizeof out->err, "%s", err);
   return -1;
 }
+int kinect2_metric_depth(const float *z_mm, float *out_mm) {
+  (void)z_mm;
+  (void)out_mm;
+  return -1;
+}
+int kinect2_ir_intrinsics(float *fx, float *fy, float *cx, float *cy) {
+  (void)fx;
+  (void)fy;
+  (void)cx;
+  (void)cy;
+  return -1;
+}

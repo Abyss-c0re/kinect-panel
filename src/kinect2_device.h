@@ -41,6 +41,10 @@ int kinect2_take_ir(uint16_t *ir, int wait_ms);
 /* Factory undistort when the device is open. +Y up, same frame as the v1 cloud. */
 int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t,
                              cube_cloud *out, int max_pts);
+/* Undistorted depth in millimetres. The receiver projects this with the
+ * intrinsics below. Fails when this process does not own the Kinect 2. */
+int kinect2_metric_depth(const float *z_mm, float *out_mm);
+int kinect2_ir_intrinsics(float *fx, float *fy, float *cx, float *cy);
 
 #ifdef __cplusplus
 }

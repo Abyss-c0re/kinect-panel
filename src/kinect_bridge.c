@@ -5,6 +5,7 @@
 #include "kinect_v4l.h"
 #include "kinect2_device.h"
 #include "kinect_fuse.h"
+#include "kinect_net.h"
 #include "fg/fg.h"
 
 #include <linux/videodev2.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef V4L2_PIX_FMT_Y10BPACK
@@ -28,11 +30,39 @@ static char source[64];
 static char vcam[64];
 static char err[160];
 static int sensor; /* 1 = Kinect gspca, 2 = Kinect 2, while running */
+static int from_net;
+static int sensor_plan;
 static uint8_t preview[KINECT_RGB_W * KINECT_RGB_H * 3];
 static int have_preview;
 static kinect_ir_tune ir_tune;
 static fg_engine *fg;
 static int fg_boost;
+
+static uint64_t bridge_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static void offer_local_image(const uint8_t *rgb, int cam, int ir) {
+  if (!rgb) return;
+  if (ir)
+    kinect_net_offer_ir(rgb, cam, bridge_now());
+  else
+    kinect_net_offer_rgb(rgb, cam, bridge_now());
+}
+
+static int peer_has(int bit) {
+  int i;
+  if (kinect_net_peer_sensors() & bit) return 1;
+  if (!kinect_net_active()) return 0;
+  for (i = 0; i < 40 && !stop_flag; i++) {
+    if (kinect_net_peer_sensors() & bit) return 1;
+    if (!kinect_net_connected() && i >= 6) return 0;
+    usleep(50000);
+  }
+  return (kinect_net_peer_sensors() & bit) != 0;
+}
 
 static void set_err(const char *s) {
   pthread_mutex_lock(&mu);
@@ -177,6 +207,7 @@ static void *bridge_main(void *arg) {
         }
       }
     }
+    offer_local_image(rgb, 1, ir);
     publish_rgb(rgb, yuyv, vfd);
   }
 
@@ -260,6 +291,7 @@ static void *bridge_v2(void *arg) {
         break;
       }
     }
+    offer_local_image(rgb, 2, ir);
     publish_rgb(rgb, yuyv, vfd);
   }
 
@@ -277,12 +309,54 @@ out:
   return NULL;
 }
 
+static void *bridge_net(void *arg) {
+  int ir = (mode[0] == 'I' || mode[0] == 'i');
+  int vfd = -1;
+  uint8_t *rgb = NULL, *yuyv = NULL;
+  (void)arg;
+  rgb = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 3);
+  yuyv = (uint8_t *)malloc((size_t)KINECT_RGB_W * KINECT_RGB_H * 2);
+  if (!rgb || !yuyv) {
+    set_err("oom");
+    goto out;
+  }
+  kinect_net_want(ir ? 3 : 2);
+  vfd = vcam[0] ? kinect_vcam_open(vcam) : -1;
+  pthread_mutex_lock(&mu);
+  sensor = sensor_plan ? sensor_plan : 1;
+  from_net = 1;
+  running = 1;
+  pthread_mutex_unlock(&mu);
+  while (!stop_flag) {
+    uint64_t ts = 0;
+    if (kinect_net_take_rgb(rgb, &ts) != 1) {
+      usleep(4000);
+      continue;
+    }
+    publish_rgb(rgb, yuyv, vfd);
+  }
+out:
+  if (vfd >= 0) close(vfd);
+  free(rgb);
+  free(yuyv);
+  pthread_mutex_lock(&mu);
+  running = 0;
+  sensor = 0;
+  from_net = 0;
+  pthread_mutex_unlock(&mu);
+  return NULL;
+}
+
 int kinect_bridge_start(const char *want_mode) {
   int use_v2, spins, i;
+  void *(*fn)(void *);
   kinect_bridge_stop();
+  stop_flag = 0;
   pthread_mutex_lock(&mu);
   err[0] = 0;
   have_preview = 0;
+  from_net = 0;
+  sensor_plan = 0;
   if (ir_tune.boost < 0.1f) kinect_ir_tune_default(&ir_tune);
   snprintf(mode, sizeof mode, "%s", (want_mode && want_mode[0] == 'I') ? "IR" : "RGB");
   pthread_mutex_unlock(&mu);
@@ -290,19 +364,33 @@ int kinect_bridge_start(const char *want_mode) {
     vcam[0] = 0; /* preview / headless still run; loopback is OUT only */
   use_v2 = image_from_v2();
   if (use_v2) {
-    snprintf(source, sizeof source, "kinect2");
-  } else {
-    if (kinect_find_source(source, sizeof source) < 0) {
-      set_err("No Kinect /dev/video* (gspca)");
+    if (kinect2_count() > 0) {
+      snprintf(source, sizeof source, "kinect2");
+      kinect_net_set_local(2);
+    } else if (peer_has(2)) {
+      from_net = 1;
+      sensor_plan = 2;
+      snprintf(source, sizeof source, "kinect2-net");
+    } else {
+      set_err("no kinect 2");
       return -1;
     }
+  } else if (kinect_find_source(source, sizeof source) == 0) {
     if (kinect_set_mode(source, mode) < 0) {
       set_err("v4l2 S_FMT failed");
       return -1;
     }
+    kinect_net_set_local(1);
+  } else if (peer_has(1)) {
+    from_net = 1;
+    sensor_plan = 1;
+    snprintf(source, sizeof source, "kinect-net");
+  } else {
+    set_err("No Kinect /dev/video* (gspca)");
+    return -1;
   }
-  stop_flag = 0;
-  if (pthread_create(&th, NULL, use_v2 ? bridge_v2 : bridge_main, NULL) != 0) {
+  fn = from_net ? bridge_net : (use_v2 ? bridge_v2 : bridge_main);
+  if (pthread_create(&th, NULL, fn, NULL) != 0) {
     set_err("bridge thread");
     return -1;
   }
@@ -338,6 +426,7 @@ void kinect_bridge_stop(void) {
   pthread_mutex_lock(&mu);
   running = 0;
   sensor = 0;
+  from_net = 0;
   pthread_mutex_unlock(&mu);
   if (fg) {
     fg_destroy(fg);
@@ -359,6 +448,14 @@ int kinect_bridge_sensor(void) {
   s = running ? sensor : 0;
   pthread_mutex_unlock(&mu);
   return s;
+}
+
+int kinect_bridge_net(void) {
+  int n;
+  pthread_mutex_lock(&mu);
+  n = running && from_net;
+  pthread_mutex_unlock(&mu);
+  return n;
 }
 
 const char *kinect_bridge_error(void) { return err; }

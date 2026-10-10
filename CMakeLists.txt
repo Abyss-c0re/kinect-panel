@@ -35,9 +35,14 @@ include(CheckLanguage)
 option(KINECT_ENABLE_HIP "Build ROCm/HIP frame-gen if a compiler is found" ON)
 option(KINECT_ENABLE_OPENXR "Build libkinect_xr + OpenXR sample if OpenXR is found" ON)
 option(KINECT_ENABLE_V2 "Build Kinect 2 depth via libfreenect2" ON)
+option(KINECT_ENABLE_GTK "Build the GTK panel and camera session" ON)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
+if(KINECT_ENABLE_GTK)
+  pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
+else()
+  message(STATUS "GTK off — kinect_share and libraries only")
+endif()
 find_package(Threads REQUIRED)
 
 find_path(FREENECT_INCLUDE_DIR
@@ -121,6 +126,7 @@ add_library(kinect_cloud STATIC
   src/cube_kinect_mesh.c
   src/kinect_sync.c
   src/kinect_fuse.c
+  src/kinect_net.c
   $<TARGET_OBJECTS:kinect2>
 )
 target_include_directories(kinect_cloud PUBLIC
@@ -133,6 +139,7 @@ if(KINECT_HAVE_V2)
   target_link_libraries(kinect_cloud PUBLIC "${KINECT2_LIBDIR}/libfreenect2.so")
 endif()
 
+if(KINECT_ENABLE_GTK)
 add_library(kinect_core STATIC
   src/kinect_v4l.c
   src/kinect_motor.c
@@ -155,6 +162,7 @@ target_link_libraries(kinect_core
     "${FREENECT_LIBRARY}"
     m
 )
+endif()
 
 add_library(kinect_fg STATIC src/fg/fg.c)
 target_include_directories(kinect_fg PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -175,17 +183,23 @@ if(KINECT_HAVE_HIP)
   endif()
   target_link_libraries(kinect_fg PUBLIC kinect_fg_hip)
   target_compile_definitions(kinect_fg PUBLIC FG_HAVE_HIP)
-  target_compile_definitions(kinect_core PUBLIC FG_HAVE_HIP)
+  if(TARGET kinect_core)
+    target_compile_definitions(kinect_core PUBLIC FG_HAVE_HIP)
+  endif()
 endif()
 
-target_link_libraries(kinect_core PUBLIC kinect_fg)
+if(TARGET kinect_core)
+  target_link_libraries(kinect_core PUBLIC kinect_fg)
+endif()
 
 # --- executables ---
 
-add_executable(kinect_panel src/kinect_panel.c)
-target_link_libraries(kinect_panel PRIVATE kinect_core)
-set_target_properties(kinect_panel PROPERTIES OUTPUT_NAME kinect_panel)
-kinect_v2_link(kinect_panel)
+if(KINECT_ENABLE_GTK)
+  add_executable(kinect_panel src/kinect_panel.c)
+  target_link_libraries(kinect_panel PRIVATE kinect_core)
+  set_target_properties(kinect_panel PROPERTIES OUTPUT_NAME kinect_panel)
+  kinect_v2_link(kinect_panel)
+endif()
 
 add_executable(kinect_depth_dump src/kinect_depth_dump.c)
 target_include_directories(kinect_depth_dump PRIVATE "${FREENECT_INCLUDE_DIR}")
@@ -201,6 +215,14 @@ target_link_libraries(fg_probe PRIVATE kinect_fg)
 add_executable(kinect_sync_proof src/kinect_sync_proof.c)
 target_link_libraries(kinect_sync_proof PRIVATE kinect_cloud)
 kinect_v2_link(kinect_sync_proof)
+
+add_executable(kinect_share src/kinect_share.c)
+target_link_libraries(kinect_share PRIVATE kinect_cloud)
+kinect_v2_link(kinect_share)
+
+add_executable(kinect_net_proof src/kinect_net_proof.c)
+target_link_libraries(kinect_net_proof PRIVATE kinect_cloud)
+kinect_v2_link(kinect_net_proof)
 
 # --- OpenXR library (no GTK) ---
 
@@ -250,9 +272,12 @@ endif()
 
 # --- install ---
 
-install(TARGETS kinect_panel kinect_depth_dump fg_probe kxr_proof kinect_sync_proof
+install(TARGETS kinect_depth_dump fg_probe kxr_proof kinect_sync_proof kinect_share kinect_net_proof
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
+if(TARGET kinect_panel)
+  install(TARGETS kinect_panel RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
 install(TARGETS kinect_cloud kinect_xr
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
@@ -268,12 +293,19 @@ endif()
 install(PROGRAMS setup_loopback.sh DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}/kinect-panel")
 
 # Convenience copy next to the historic launcher
-add_custom_command(TARGET kinect_panel POST_BUILD
+if(TARGET kinect_panel)
+  add_custom_command(TARGET kinect_panel POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_SOURCE_DIR}/bin"
+    COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:kinect_panel> "${CMAKE_SOURCE_DIR}/bin/kinect_panel"
+    COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:kinect_depth_dump> "${CMAKE_SOURCE_DIR}/bin/kinect_depth_dump"
+    COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:fg_probe> "${CMAKE_SOURCE_DIR}/bin/fg_probe"
+    COMMENT "Copy binaries to source bin/ for the local launcher"
+  )
+endif()
+add_custom_command(TARGET kinect_share POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_SOURCE_DIR}/bin"
-  COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:kinect_panel> "${CMAKE_SOURCE_DIR}/bin/kinect_panel"
-  COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:kinect_depth_dump> "${CMAKE_SOURCE_DIR}/bin/kinect_depth_dump"
-  COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:fg_probe> "${CMAKE_SOURCE_DIR}/bin/fg_probe"
-  COMMENT "Copy binaries to source bin/ for the local launcher"
+  COMMAND "${CMAKE_COMMAND}" -E copy $<TARGET_FILE:kinect_share> "${CMAKE_SOURCE_DIR}/bin/kinect_share"
+  COMMENT "Copy kinect_share to source bin/"
 )
 add_custom_command(TARGET kxr_proof POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_SOURCE_DIR}/bin"

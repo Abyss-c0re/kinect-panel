@@ -28,6 +28,8 @@ cmake --install build --prefix ~/.local
 ## Use
 
 - **Camera** tab: preview, RGB / IR / Cloud, sensor buttons Auto / Kinect / Kinect 2 / Both, Align, tilt. Camera ON starts the session. The sensor applies to RGB, IR, and Cloud. It does not switch the view.
+- **F11** fills the screen with the current view (RGB, IR, or the point cloud). F11 or Esc leaves it. In that view, Left and Right cycle Auto / Kinect / Kinect 2 / Both, and Up and Down cycle RGB / IR / Cloud.
+- **Share** listens on UDP port 8765 (`KINECT_SHARE_PORT`). **Connect** dials `host[:port]` or `KINECT_PEER`. The link is latest-frame only: depth moves as 8×8 block deltas, previews as 320×240 RGB565. A sensor this machine does not have shows up on the same Auto / Kinect / Kinect 2 / Both control. Share does not turn a camera on. `./build/bin/kinect_share --listen 8765` is the headless side (no GTK).
 - **Image** tab: IR grade, Cloud clip/density/color, Align (fits Kinect 2 onto Kinect), Frame gen boost
 - **Quit** / window X stops the process and powers both sensors down. **Hide** keeps the process.
 - RGB/IR session publishes **Kinect Webcam** (`v4l2loopback`):

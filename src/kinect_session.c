@@ -5,6 +5,7 @@
 #include "kinect_cloud_view.h"
 #include "kinect_fuse.h"
 #include "kinect_motor.h"
+#include "kinect_net.h"
 #include "kinect2_device.h"
 
 #include <errno.h>
@@ -73,6 +74,16 @@ static void live_led(kinect_mode m) {
   }
 }
 
+static void net_want_for(kinect_mode mode) {
+  if (!kinect_net_active()) return;
+  if (mode == KINECT_MODE_IR)
+    kinect_net_want(3);
+  else if (mode == KINECT_MODE_RGB)
+    kinect_net_want(2);
+  else
+    kinect_net_want(1);
+}
+
 int kinect_session_off(void) {
   kinect_bridge_stop();
   kinect_cloud_stop();
@@ -80,6 +91,7 @@ int kinect_session_off(void) {
   if (kinect_motor_open() == 0)
     kinect_motor_set_led(LED_OFF);
   kinect_motor_close();
+  net_want_for(KINECT_MODE_OFF);
   pthread_mutex_lock(&mu);
   cur = KINECT_MODE_OFF;
   err[0] = 0;
@@ -109,7 +121,13 @@ int kinect_session_start(kinect_mode mode) {
       pthread_mutex_unlock(&mu);
       return -1;
     }
-    live_led(KINECT_MODE_CLOUD);
+    {
+      kinect_fuse_stats st;
+      int skip_led = 0;
+      kinect_fuse_get_stats(&st);
+      if (st.v1_open && !kinect_fuse_local_v1()) skip_led = 1;
+      if (!skip_led) live_led(KINECT_MODE_CLOUD);
+    }
   } else {
     const char *m = (mode == KINECT_MODE_IR) ? "IR" : "RGB";
     usleep(200000);
@@ -122,9 +140,10 @@ int kinect_session_start(kinect_mode mode) {
       pthread_mutex_unlock(&mu);
       return -1;
     }
-    /* Kinect 2 lights its own lamp. Do not open the Kinect motor for that. */
-    if (kinect_bridge_sensor() != 2) live_led(mode);
+    /* Kinect 2 lights its own lamp. A remote Kinect is not this USB motor. */
+    if (kinect_bridge_sensor() != 2 && !kinect_bridge_net()) live_led(mode);
   }
+  net_want_for(mode);
 
   pthread_mutex_lock(&mu);
   cur = mode;
@@ -193,11 +212,18 @@ void kinect_session_status_json(char *buf, size_t n) {
       v1 = 1;
     }
   }
-  snprintf(buf, n,
-           "{\"ok\":true,\"running\":%s,\"mode\":\"%s\",\"headless\":%s,\"collect\":false,"
-           "\"src\":\"%s\",\"v1\":%s,\"v2\":%s,\"skew_ms\":%d,\"paired\":%s,\"pipe\":\"%s\"}\n",
-           run ? "true" : "false", kinect_session_mode_name(m), hl ? "true" : "false", src,
-           v1 ? "true" : "false", v2 ? "true" : "false", skew, paired ? "true" : "false", pipe);
+  {
+    int net = kinect_net_connected();
+    int rtt = net ? kinect_net_rtt_ms() : -1;
+    int peer = kinect_net_peer_sensors();
+    snprintf(buf, n,
+             "{\"ok\":true,\"running\":%s,\"mode\":\"%s\",\"headless\":%s,\"collect\":false,"
+             "\"src\":\"%s\",\"v1\":%s,\"v2\":%s,\"skew_ms\":%d,\"paired\":%s,\"pipe\":\"%s\","
+             "\"net\":%s,\"rtt\":%d,\"peer\":%d}\n",
+             run ? "true" : "false", kinect_session_mode_name(m), hl ? "true" : "false", src,
+             v1 ? "true" : "false", v2 ? "true" : "false", skew, paired ? "true" : "false", pipe,
+             net ? "true" : "false", rtt, peer);
+  }
 }
 
 int kinect_ctl_path(char *out, size_t n) {
@@ -392,6 +418,35 @@ int kinect_session_dispatch(const char *cmd, char *reply, size_t n) {
       kinect_session_status_json(reply, n);
     return 0;
   }
+  if (strcmp(buf, "share") == 0) {
+    int port = 0;
+    const char *e = getenv("KINECT_SHARE_PORT");
+    if (e && atoi(e) > 0) port = atoi(e);
+    if (kinect_net_listen(port) != 0)
+      snprintf(reply, n, "{\"ok\":false,\"error\":\"%s\"}\n",
+               kinect_net_error()[0] ? kinect_net_error() : "share failed");
+    else
+      kinect_session_status_json(reply, n);
+    return 0;
+  }
+  if (strncmp(buf, "connect", 7) == 0 && (buf[7] == 0 || buf[7] == ' ')) {
+    const char *arg = buf + 7;
+    while (*arg == ' ') arg++;
+    if (!arg[0]) arg = getenv("KINECT_PEER");
+    if (!arg || !arg[0])
+      snprintf(reply, n, "{\"ok\":false,\"error\":\"need host\"}\n");
+    else if (kinect_net_connect(arg) != 0)
+      snprintf(reply, n, "{\"ok\":false,\"error\":\"%s\"}\n",
+               kinect_net_error()[0] ? kinect_net_error() : "connect failed");
+    else
+      kinect_session_status_json(reply, n);
+    return 0;
+  }
+  if (strcmp(buf, "net off") == 0) {
+    kinect_net_stop();
+    kinect_session_status_json(reply, n);
+    return 0;
+  }
   if (strcmp(buf, "raise") == 0) {
     snprintf(reply, n, "{\"ok\":false,\"error\":\"headless\",\"mode\":\"%s\"}\n",
              kinect_session_mode_name(kinect_session_mode()));
@@ -412,7 +467,10 @@ static int hl_dispatch(const char *cmd, char *reply, size_t n) {
   return q;
 }
 
-static void hl_atexit(void) { kinect_session_off(); }
+static void hl_atexit(void) {
+  kinect_session_off();
+  kinect_net_stop();
+}
 
 int kinect_headless_run(kinect_mode mode) {
   if (mode == KINECT_MODE_OFF) mode = KINECT_MODE_RGB;

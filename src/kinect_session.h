@@ -32,7 +32,9 @@ void kinect_session_status_json(char *buf, size_t n);
 
 /* Control socket — IN command / OUT JSON. One owner process.
  * Commands: OFF | START rgb|ir|cloud [v1|v2|both|auto] | ALIGN | ALIGN RESET |
- *           STATUS | QUIT | RAISE
+ *           SHARE | CONNECT host[:port] | NET OFF | STATUS | QUIT | RAISE
+ * SHARE binds UDP 8765 (or KINECT_SHARE_PORT). CONNECT dials KINECT_PEER when
+ * the host is omitted. A missing local sensor is filled by the peer.
  * START with no source keeps the current sensor. rgb/ir + v2 or both opens
  * the Kinect 2 color or IR camera. Cloud + both fuses both depth streams. */
 int kinect_ctl_path(char *out, size_t n);

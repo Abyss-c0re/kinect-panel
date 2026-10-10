@@ -366,3 +366,25 @@ int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t, cube_c
   if (!out->ok) snprintf(out->err, sizeof out->err, "empty kinect 2 cloud");
   return out->ok ? 0 : -1;
 }
+
+int kinect2_metric_depth(const float *z_mm, float *out_mm) {
+  libfreenect2::Frame depth(KINECT2_W, KINECT2_H, 4, (unsigned char *)z_mm);
+  if (!g_reg || !g_undistorted || !z_mm || !out_mm) return -1;
+  depth.format = libfreenect2::Frame::Float;
+  g_reg->undistortDepth(&depth, g_undistorted);
+  if (!g_undistorted->data) return -1;
+  memcpy(out_mm, g_undistorted->data, (size_t)KINECT2_N * sizeof(float));
+  return 0;
+}
+
+int kinect2_ir_intrinsics(float *fx, float *fy, float *cx, float *cy) {
+  libfreenect2::Freenect2Device::IrCameraParams p;
+  if (!g_dev || !fx || !fy || !cx || !cy) return -1;
+  p = g_dev->getIrCameraParams();
+  if (!(p.fx > 1.f) || !(p.fy > 1.f)) return -1;
+  *fx = p.fx;
+  *fy = p.fy;
+  *cx = p.cx;
+  *cy = p.cy;
+  return 0;
+}

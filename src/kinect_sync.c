@@ -398,12 +398,38 @@ static void rigid_from_ypr(float yaw, float pitch, float roll, const ksync_v3 *c
   t_from_centroids(ca, cb, r->R, r->t);
 }
 
+/* yaw0 is 0 for cameras that sit side by side, 180 when they face each other. */
+static void search_grid(float yaw0, const ksync_v3 *sa, int na, const ksync_v3 *sb, int nb,
+                        const ksync_v3 *ca, const ksync_v3 *cb, float thresh, ksync_rigid *best,
+                        float *best_score, int *best_inl) {
+  int yaw_i, pitch_i, roll_i;
+  for (yaw_i = -15; yaw_i <= 15; yaw_i++) {
+    float yaw = yaw0 + (float)yaw_i * 4.f;
+    for (pitch_i = -6; pitch_i <= 6; pitch_i++) {
+      float pitch = (float)pitch_i * 4.f;
+      for (roll_i = -3; roll_i <= 3; roll_i++) {
+        ksync_rigid trial;
+        float sc;
+        int inl = 0;
+        float roll = (float)roll_i * 4.f;
+        rigid_from_ypr(yaw, pitch, roll, ca, cb, &trial);
+        sc = score_rt(sa, na, sb, nb, trial.R, trial.t, thresh, &inl);
+        if (sc < *best_score) {
+          *best_score = sc;
+          *best = trial;
+          *best_inl = inl;
+        }
+      }
+    }
+  }
+}
+
 int ksync_align(ksync_rigid *out, ksync_align_result *res, const cube_cloud *v1,
                 const cube_cloud *v2) {
   ksync_v3 sa[160], sb[160], ca, cb;
   ksync_rigid best, trial;
   float best_score = 1e9f, yaw, pitch, roll;
-  int na, nb, best_inl = 0, yaw_i, pitch_i, roll_i, iter, ax;
+  int na, nb, best_inl = 0, iter, ax;
   float thresh = 0.14f;
   if (res) memset(res, 0, sizeof *res);
   if (!out || !v1 || !v2 || v1->n < 30 || v2->n < 30) return -1;
@@ -413,25 +439,8 @@ int ksync_align(ksync_rigid *out, ksync_align_result *res, const cube_cloud *v1,
   centroid(sa, na, &ca);
   centroid(sb, nb, &cb);
   ksync_rigid_identity(&best);
-
-  for (yaw_i = -15; yaw_i <= 15; yaw_i++) {
-    yaw = (float)yaw_i * 4.f;
-    for (pitch_i = -6; pitch_i <= 6; pitch_i++) {
-      pitch = (float)pitch_i * 4.f;
-      for (roll_i = -3; roll_i <= 3; roll_i++) {
-        float sc;
-        int inl = 0;
-        roll = (float)roll_i * 4.f;
-        rigid_from_ypr(yaw, pitch, roll, &ca, &cb, &trial);
-        sc = score_rt(sa, na, sb, nb, trial.R, trial.t, thresh, &inl);
-        if (sc < best_score) {
-          best_score = sc;
-          best = trial;
-          best_inl = inl;
-        }
-      }
-    }
-  }
+  search_grid(0.f, sa, na, sb, nb, &ca, &cb, thresh, &best, &best_score, &best_inl);
+  search_grid(180.f, sa, na, sb, nb, &ca, &cb, thresh, &best, &best_score, &best_inl);
 
   /* Walk yaw, pitch, roll, then translation. Full overlap locks the rotation;
    * the steps pull a partial overlap off the centroid guess. */

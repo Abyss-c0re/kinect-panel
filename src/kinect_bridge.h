@@ -13,6 +13,8 @@ void kinect_bridge_stop(void);
 int kinect_bridge_running(void);
 /* 1 = Kinect gspca, 2 = Kinect 2 color/IR, 0 = not streaming. */
 int kinect_bridge_sensor(void);
+/* 1 when the preview is the peer's camera, not a local USB open. */
+int kinect_bridge_net(void);
 const char *kinect_bridge_error(void);
 const char *kinect_bridge_vcam(void);
 int kinect_bridge_preview_rgb(uint8_t *rgb /* 640*480*3 */);

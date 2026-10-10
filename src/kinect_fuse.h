@@ -62,6 +62,11 @@ const char *kinect_fuse_error(void);
 int kinect_fuse_align(ksync_align_result *res);
 void kinect_fuse_reset_rigid(void);
 void kinect_fuse_get_rigid(ksync_rigid *r);
+/* 1 when this process opened the Kinect v1 USB camera for depth. */
+int kinect_fuse_local_v1(void);
+/* Latest fused cloud and the two sensor clouds. NULL skips a slot.
+ * Returns 0 when the fused cloud has points. */
+int kinect_fuse_snapshot_parts(cube_cloud *merged, cube_cloud *v1, cube_cloud *v2);
 
 /* Enumerate only. Does not start a stream. */
 int kinect_fuse_probe(int *v1, int *v2);

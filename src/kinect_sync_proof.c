@@ -139,6 +139,33 @@ int main(void) {
   fprintf(stderr, "cloud residual=%.4f m\n", acc);
   expect(acc < 0.03, "mapped cloud sits on the kinect");
 
+  {
+    cube_cloud face;
+    ksync_rigid face_rig;
+    ksync_align_result face_ar;
+    cube_cloud_init(&face);
+    cube_cloud_reserve(&face, room.n);
+    for (i = 0; i < room.n; i++) {
+      cube_cloud_pt *p = &face.pt[face.n++];
+      *p = room.pt[i];
+      rot_y(180.f, room.pt[i].x, room.pt[i].y, room.pt[i].z, &p->x, &p->y, &p->z);
+      p->x += 0.35f;
+      p->y += -0.04f;
+      p->z += 0.15f;
+    }
+    face.ok = 1;
+    ksync_rigid_identity(&face_rig);
+    memset(&face_ar, 0, sizeof face_ar);
+    expect(ksync_align(&face_rig, &face_ar, &room, &face) == 0, "facing align converges");
+    if (face_ar.ok) {
+      fprintf(stderr, "facing residual=%.4f inliers=%d yaw=%.2f pitch=%.2f\n", face_ar.residual_m,
+              face_ar.inliers, face_ar.yaw_deg, face_ar.pitch_deg);
+      expect(face_ar.residual_m < 0.05f, "facing residual");
+      expect(fabsf(fabsf(face_ar.yaw_deg) - 180.f) < 8.f, "facing yaw");
+    }
+    cube_cloud_free(&face);
+  }
+
   expect(ksync_rigid_save(&rig, path) == 0, "save rigid");
   ksync_rigid_identity(&id);
   expect(ksync_rigid_load(&id, path) == 0, "load rigid");
