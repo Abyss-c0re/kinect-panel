@@ -492,17 +492,31 @@ static void adopt_peer(void) {
   note_sources();
 }
 
-static void offer_local_v2(const float *z_mm, uint64_t ts) {
+/* One undistort feeds the local cloud and the wire. The net thread already
+ * limits how often a new depth image is packetised. */
+static int project_local_v2(cube_cloud *dst, const float *z_mm, uint64_t ts, const cube_cloud_tune *t,
+                            int budget) {
   float fx, fy, cx, cy;
-  uint64_t now = mono_us();
-  if (!z_mm || now - last_offer2_us < 45000ull) return;
-  last_offer2_us = now;
-  if (kinect2_ir_intrinsics(&fx, &fy, &cx, &cy) == 0)
-    kinect_net_offer_intrinsics(2, fx, fy, cx, cy);
-  if (wire_mm && kinect2_metric_depth(z_mm, wire_mm) == 0)
-    kinect_net_offer_depth(2, wire_mm, KINECT2_W, KINECT2_H, 1, ts);
-  else
-    kinect_net_offer_depth(2, z_mm, KINECT2_W, KINECT2_H, 1, ts);
+  int metric = 0;
+  uint64_t now;
+  if (!dst || !z_mm) return -1;
+  if (wire_mm && kinect2_metric_depth(z_mm, wire_mm) == 0 &&
+      kinect2_cloud_from_undistorted(t, dst, budget) == 0)
+    metric = 1;
+  else if (kinect2_cloud_from_depth(z_mm, t, dst, budget) != 0)
+    return -1;
+  ksync_tint_v2(dst);
+  now = mono_us();
+  if (now - last_offer2_us >= 45000ull) {
+    last_offer2_us = now;
+    if (kinect2_ir_intrinsics(&fx, &fy, &cx, &cy) == 0)
+      kinect_net_offer_intrinsics(2, fx, fy, cx, cy);
+    if (metric)
+      kinect_net_offer_depth(2, wire_mm, KINECT2_W, KINECT2_H, 1, ts);
+    else
+      kinect_net_offer_depth(2, z_mm, KINECT2_W, KINECT2_H, 1, ts);
+  }
+  return 0;
 }
 
 static int build_remote_v2(cube_cloud *dst, const float *z_mm, const cube_cloud_tune *t, int budget) {
@@ -611,10 +625,6 @@ static void pump(void) {
         fresh2 = 1;
         guard++;
       }
-      if (fresh2) {
-        int prev = (w2 + RING - 1) % RING;
-        offer_local_v2(ring2[prev], stamp2[prev]);
-      }
     }
     if (remote2 && net_u16) {
       uint64_t ts = 0;
@@ -676,9 +686,7 @@ static void pump(void) {
     if (up2 && i2 >= 0) {
       if (remote2) {
         if (build_remote_v2(&c2, ring2[i2], &tcopy, budget) != 0) cube_cloud_clear(&c2);
-      } else if (kinect2_cloud_from_depth(ring2[i2], &tcopy, &c2, budget) == 0)
-        ksync_tint_v2(&c2);
-      else
+      } else if (project_local_v2(&c2, ring2[i2], stamp2[i2], &tcopy, budget) != 0)
         cube_cloud_clear(&c2);
     }
     cube_cloud_clear(&merged);
@@ -896,7 +904,13 @@ int kinect_fuse_align(ksync_align_result *res) {
   cube_cloud_free(&a);
   cube_cloud_free(&b);
   if (rc != 0) {
-    set_err("align found no overlap");
+    char why[160];
+    if (res && (res->inliers > 0 || res->residual_m > 0.f))
+      snprintf(why, sizeof why, "align found no overlap (inl %d res %.3f yaw %.0f)", res->inliers,
+               res->residual_m, res->yaw_deg);
+    else
+      snprintf(why, sizeof why, "align found no overlap");
+    set_err(why);
     return -1;
   }
   pthread_mutex_lock(&mu);

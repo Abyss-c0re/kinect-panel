@@ -321,14 +321,12 @@ int kinect2_take_ir(uint16_t *ir, int wait_ms) {
   return rc;
 }
 
-int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t, cube_cloud *out,
-                             int max_pts) {
+static int project_undistorted(const cube_cloud_tune *t, cube_cloud *out, int max_pts) {
   cube_cloud_tune def;
-  libfreenect2::Frame depth(KINECT2_W, KINECT2_H, 4, (unsigned char *)z_mm);
   int stride, r, c, n = 0;
   float zn, zf;
-  if (!out || !z_mm) return -1;
-  if (!g_reg || !g_undistorted) {
+  if (!out) return -1;
+  if (!g_reg || !g_undistorted || !g_undistorted->data) {
     set_err("kinect 2 not open");
     return -1;
   }
@@ -341,8 +339,6 @@ int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t, cube_c
   zf = t->z_far;
   if (zf < zn + 0.1f) zf = zn + 0.1f;
   stride = ksync_cover_stride(KINECT2_W, KINECT2_H, t->stride, max_pts);
-  depth.format = libfreenect2::Frame::Float;
-  g_reg->undistortDepth(&depth, g_undistorted);
   cube_cloud_clear(out);
   if (cube_cloud_reserve(out, max_pts) < 0) {
     snprintf(out->err, sizeof out->err, "oom");
@@ -365,6 +361,23 @@ int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t, cube_c
   out->ok = n > 0;
   if (!out->ok) snprintf(out->err, sizeof out->err, "empty kinect 2 cloud");
   return out->ok ? 0 : -1;
+}
+
+int kinect2_cloud_from_undistorted(const cube_cloud_tune *t, cube_cloud *out, int max_pts) {
+  return project_undistorted(t, out, max_pts);
+}
+
+int kinect2_cloud_from_depth(const float *z_mm, const cube_cloud_tune *t, cube_cloud *out,
+                             int max_pts) {
+  libfreenect2::Frame depth(KINECT2_W, KINECT2_H, 4, (unsigned char *)z_mm);
+  if (!out || !z_mm) return -1;
+  if (!g_reg || !g_undistorted) {
+    set_err("kinect 2 not open");
+    return -1;
+  }
+  depth.format = libfreenect2::Frame::Float;
+  g_reg->undistortDepth(&depth, g_undistorted);
+  return project_undistorted(t, out, max_pts);
 }
 
 int kinect2_metric_depth(const float *z_mm, float *out_mm) {

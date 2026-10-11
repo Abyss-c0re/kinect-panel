@@ -87,13 +87,15 @@ static void usage(void) {
         "  --src auto|v1|v2|both    default both\n"
         "  --seconds N              stop after N seconds (default: until signal)\n"
         "  --align-after N          fit Kinect 2 onto Kinect once both clouds exist\n"
+        "  --near M --far M         depth window in metres (default 0.50 .. 3.50)\n"
         "  --dump PATH              write the fused xyz (plus .v1.xyz and .v2.xyz)\n",
         stdout);
 }
 
 int main(int argc, char **argv) {
   int i, do_listen = 0, do_connect = 0, port = 0, seconds = 0, align_after = 0;
-  int did_align = 0, did_dump = 0;
+  int did_align = 0, did_dump = 0, have_near = 0, have_far = 0;
+  float z_near = 0.f, z_far = 0.f;
   kinect_src src = KINECT_SRC_BOTH;
   const char *host = NULL;
   const char *dump = NULL;
@@ -133,6 +135,16 @@ int main(int argc, char **argv) {
       dump = argv[++i];
       continue;
     }
+    if (strcmp(argv[i], "--near") == 0 && i + 1 < argc) {
+      z_near = strtof(argv[++i], NULL);
+      have_near = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--far") == 0 && i + 1 < argc) {
+      z_far = strtof(argv[++i], NULL);
+      have_far = 1;
+      continue;
+    }
     fprintf(stderr, "unknown arg %s\n", argv[i]);
     usage();
     return 1;
@@ -149,6 +161,13 @@ int main(int argc, char **argv) {
   signal(SIGHUP, on_sig);
 
   kinect_fuse_set_source(src);
+  if (have_near || have_far) {
+    cube_cloud_tune tune;
+    kinect_fuse_get_tune(&tune);
+    if (have_near) tune.z_near = z_near;
+    if (have_far) tune.z_far = z_far;
+    kinect_fuse_set_tune(&tune);
+  }
   kinect_fuse_probe(&v1, &v2);
   kinect_net_set_local((v1 ? 1 : 0) | (v2 ? 2 : 0));
   kinect_net_want(1);
@@ -206,6 +225,8 @@ int main(int argc, char **argv) {
                ar.yaw_deg, ar.pitch_deg);
         fflush(stdout);
         did_align = 1;
+        /* The fuse thread rebuilds the merged cloud on its next frame. */
+        usleep(400000);
         if (dump && !did_dump && dump_clouds(dump) == 0) did_dump = 1;
       } else {
         printf("align waiting: %s\n", kinect_fuse_error());

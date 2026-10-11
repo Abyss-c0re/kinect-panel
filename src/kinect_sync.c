@@ -321,20 +321,6 @@ static void apply_rt(const float R[9], const float t[3], ksync_v3 *p) {
   p->z = R[6] * x + R[7] * y + R[8] * z + t[2];
 }
 
-static int sample_cloud(const cube_cloud *c, ksync_v3 *out, int maxn) {
-  int step, i, n = 0;
-  if (!c || !c->pt || c->n < 1 || maxn < 1) return 0;
-  step = c->n / maxn;
-  if (step < 1) step = 1;
-  for (i = 0; i < c->n && n < maxn; i += step) {
-    out[n].x = c->pt[i].x;
-    out[n].y = c->pt[i].y;
-    out[n].z = c->pt[i].z;
-    n++;
-  }
-  return n;
-}
-
 static void centroid(const ksync_v3 *p, int n, ksync_v3 *c) {
   int i;
   double x = 0, y = 0, z = 0;
@@ -352,36 +338,127 @@ static void centroid(const ksync_v3 *p, int n, ksync_v3 *c) {
   c->z = (float)(z / n);
 }
 
-static float nearest2(const ksync_v3 *a, int na, ksync_v3 p) {
-  int i;
-  float best = 1e30f;
-  for (i = 0; i < na; i++) {
-    float dx = a[i].x - p.x, dy = a[i].y - p.y, dz = a[i].z - p.z;
-    float d = dx * dx + dy * dy + dz * dz;
-    if (d < best) best = d;
-  }
-  return best;
+/* Match distance. A stride of 120 points from a full cloud is coarser than
+ * this, so those samples cannot see a real wall. Keep the surface spacing. */
+#define KSYNC_MATCH_M 0.12f
+#define KSYNC_HASH 8192
+
+static unsigned khash_cell(int x, int y, int z) {
+  unsigned h = (unsigned)x * 73856093u ^ (unsigned)y * 19349663u ^ (unsigned)z * 83492791u;
+  return h & (KSYNC_HASH - 1u);
 }
 
-/* Lower is better. Thin overlap scores as a miss. */
-static float score_rt(const ksync_v3 *a, int na, const ksync_v3 *b, int nb,
-                      const float R[9], const float t[3], float thresh, int *inliers) {
+typedef struct ksync_hash {
+  const ksync_v3 *p;
+  int *next;
+  int head[KSYNC_HASH];
+  float cell;
+} ksync_hash;
+
+static int hash_build(ksync_hash *h, const ksync_v3 *p, int n, float cell) {
+  int i;
+  h->p = p;
+  h->cell = cell;
+  h->next = (int *)malloc(sizeof(int) * (n > 0 ? (size_t)n : 1));
+  if (!h->next) return -1;
+  for (i = 0; i < KSYNC_HASH; i++) h->head[i] = -1;
+  for (i = 0; i < n; i++) {
+    int ix = (int)floorf(p[i].x / cell);
+    int iy = (int)floorf(p[i].y / cell);
+    int iz = (int)floorf(p[i].z / cell);
+    unsigned b = khash_cell(ix, iy, iz);
+    h->next[i] = h->head[b];
+    h->head[b] = i;
+  }
+  return 0;
+}
+
+/* Inliers of b under R,t against the hashed cloud. *mean is the inlier average. */
+static void hash_count(const ksync_hash *h, const ksync_v3 *b, int nb, const float R[9],
+                       const float t[3], float thresh, int *inliers, float *mean) {
   int i, inl = 0;
   double acc = 0;
   float th2 = thresh * thresh;
+  float cell = h->cell;
   for (i = 0; i < nb; i++) {
     ksync_v3 p = b[i];
-    float d2;
+    float best = 1e30f;
+    int ix, iy, iz, dx, dy, dz;
     apply_rt(R, t, &p);
-    d2 = nearest2(a, na, p);
-    if (d2 <= th2) {
-      acc += sqrt((double)d2);
+    ix = (int)floorf(p.x / cell);
+    iy = (int)floorf(p.y / cell);
+    iz = (int)floorf(p.z / cell);
+    for (dz = -1; dz <= 1; dz++) {
+      for (dy = -1; dy <= 1; dy++) {
+        for (dx = -1; dx <= 1; dx++) {
+          int j = h->head[khash_cell(ix + dx, iy + dy, iz + dz)];
+          while (j >= 0) {
+            float ddx = h->p[j].x - p.x;
+            float ddy = h->p[j].y - p.y;
+            float ddz = h->p[j].z - p.z;
+            float d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (d2 < best) best = d2;
+            j = h->next[j];
+          }
+        }
+      }
+    }
+    if (best <= th2) {
+      acc += sqrt((double)best);
       inl++;
     }
   }
   if (inliers) *inliers = inl;
-  if (inl < 20) return 1000.f + (float)(nb - inl);
-  return (float)(acc / inl);
+  if (mean) *mean = inl ? (float)(acc / (double)inl) : 1.f;
+}
+
+/* One point per spatial cell so a scanline stride cannot skip a wall. */
+static int voxel_keep(const ksync_v3 *p, int n, ksync_v3 *out, int maxn, float cell) {
+  enum { H = 4096 };
+  int cx[H], cy[H], cz[H], used[H];
+  int i, kept = 0;
+  memset(used, 0, sizeof used);
+  for (i = 0; i < n && kept < maxn; i++) {
+    int x = (int)floorf(p[i].x / cell);
+    int y = (int)floorf(p[i].y / cell);
+    int z = (int)floorf(p[i].z / cell);
+    unsigned h = khash_cell(x, y, z) & (unsigned)(H - 1);
+    unsigned step;
+    for (step = 0; step < H; step++) {
+      unsigned s = (h + step) & (unsigned)(H - 1);
+      if (!used[s]) {
+        used[s] = 1;
+        cx[s] = x;
+        cy[s] = y;
+        cz[s] = z;
+        out[kept++] = p[i];
+        break;
+      }
+      if (cx[s] == x && cy[s] == y && cz[s] == z) break;
+    }
+  }
+  return kept;
+}
+
+static int copy_pts(const cube_cloud *c, ksync_v3 **out) {
+  ksync_v3 *p;
+  int i;
+  if (!c || c->n < 1 || !c->pt) return 0;
+  p = (ksync_v3 *)malloc(sizeof(*p) * (size_t)c->n);
+  if (!p) return -1;
+  for (i = 0; i < c->n; i++) {
+    p[i].x = c->pt[i].x;
+    p[i].y = c->pt[i].y;
+    p[i].z = c->pt[i].z;
+  }
+  *out = p;
+  return c->n;
+}
+
+static int pose_better(int inl, float mean, int best_inl, float best_mean) {
+  if (inl > best_inl) return 1;
+  if (inl == best_inl && mean < best_mean - 1e-4f) return 1;
+  return 0;
 }
 
 static void t_from_centroids(const ksync_v3 *ca, const ksync_v3 *cb, const float R[9],
@@ -398,95 +475,199 @@ static void rigid_from_ypr(float yaw, float pitch, float roll, const ksync_v3 *c
   t_from_centroids(ca, cb, r->R, r->t);
 }
 
-/* yaw0 is 0 for cameras that sit side by side, 180 when they face each other. */
-static void search_grid(float yaw0, const ksync_v3 *sa, int na, const ksync_v3 *sb, int nb,
-                        const ksync_v3 *ca, const ksync_v3 *cb, float thresh, ksync_rigid *best,
-                        float *best_score, int *best_inl) {
-  int yaw_i, pitch_i, roll_i;
-  for (yaw_i = -15; yaw_i <= 15; yaw_i++) {
-    float yaw = yaw0 + (float)yaw_i * 4.f;
-    for (pitch_i = -6; pitch_i <= 6; pitch_i++) {
-      float pitch = (float)pitch_i * 4.f;
-      for (roll_i = -3; roll_i <= 3; roll_i++) {
-        ksync_rigid trial;
-        float sc;
-        int inl = 0;
-        float roll = (float)roll_i * 4.f;
-        rigid_from_ypr(yaw, pitch, roll, ca, cb, &trial);
-        sc = score_rt(sa, na, sb, nb, trial.R, trial.t, thresh, &inl);
-        if (sc < *best_score) {
-          *best_score = sc;
-          *best = trial;
-          *best_inl = inl;
+/* Returns 1 when this pose replaces *best. Yaw, pitch, and roll stay the
+ * angles that built R. Decomposing R later drops a coupled roll. */
+static int consider_pose(const ksync_hash *h, const ksync_v3 *b, int nb, float yaw, float pitch,
+                         float roll, const float t[3], ksync_rigid *best, int *best_inl,
+                         float *best_mean) {
+  ksync_rigid trial;
+  float mean = 1.f;
+  int inl = 0;
+  ksync_R_ypr(yaw, pitch, roll, trial.R);
+  trial.t[0] = t[0];
+  trial.t[1] = t[1];
+  trial.t[2] = t[2];
+  hash_count(h, b, nb, trial.R, trial.t, KSYNC_MATCH_M, &inl, &mean);
+  if (!pose_better(inl, mean, *best_inl, *best_mean)) return 0;
+  *best = trial;
+  *best_inl = inl;
+  *best_mean = mean;
+  return 1;
+}
+
+/* Cameras that face each other do not share a centroid. Walk the baseline
+ * from the seed without snapping translation back onto the centroids. */
+static void descend_facing(const ksync_hash *h, const ksync_v3 *b, int nb, float *yaw,
+                           float *pitch, float *roll, ksync_rigid *best, int *best_inl,
+                           float *best_mean) {
+  static const float rounds[3][4] = {
+      {4.f, 4.f, 4.f, 0.12f},
+      {2.f, 2.f, 2.f, 0.06f},
+      {1.f, 1.f, 1.f, 0.03f},
+  };
+  int round, iter;
+  for (round = 0; round < 3; round++) {
+    for (iter = 0; iter < 8; iter++) {
+      int ax, improved = 0;
+      for (ax = 0; ax < 6; ax++) {
+        int dir;
+        float step = ax < 3 ? rounds[round][ax] : rounds[round][3];
+        for (dir = -1; dir <= 1; dir += 2) {
+          float y2 = *yaw, p2 = *pitch, r2 = *roll;
+          float t2[3] = {best->t[0], best->t[1], best->t[2]};
+          if (ax == 0) y2 += (float)dir * step;
+          else if (ax == 1) p2 += (float)dir * step;
+          else if (ax == 2) r2 += (float)dir * step;
+          else
+            t2[ax - 3] += (float)dir * step;
+          if (fabsf(fabsf(y2) - 180.f) > 40.f) continue;
+          if (consider_pose(h, b, nb, y2, p2, r2, t2, best, best_inl, best_mean)) {
+            *yaw = y2;
+            *pitch = p2;
+            *roll = r2;
+            improved = 1;
+          }
         }
       }
+      if (!improved) break;
     }
   }
 }
 
 int ksync_align(ksync_rigid *out, ksync_align_result *res, const cube_cloud *v1,
                 const cube_cloud *v2) {
-  ksync_v3 sa[160], sb[160], ca, cb;
-  ksync_rigid best, trial;
-  float best_score = 1e9f, yaw, pitch, roll;
-  int na, nb, best_inl = 0, iter, ax;
-  float thresh = 0.14f;
+  ksync_v3 *pa = NULL, *pb = NULL, *qb = NULL;
+  ksync_hash hash;
+  ksync_v3 ca, cb;
+  ksync_rigid cent, face, chosen;
+  float cent_mean = 1.f, face_mean = 1.f, full_mean = 1.f, yaw;
+  float face_yaw = 180.f, face_pitch = 0.f, face_roll = 0.f;
+  int na, nb, nq, cent_inl = 0, face_inl = 0, full_inl = 0;
+  int base, ys, ps, rs, accept_cent, accept_face, use_face;
+  hash.next = NULL;
   if (res) memset(res, 0, sizeof *res);
   if (!out || !v1 || !v2 || v1->n < 30 || v2->n < 30) return -1;
-  na = sample_cloud(v1, sa, 120);
-  nb = sample_cloud(v2, sb, 120);
-  if (na < 30 || nb < 30) return -1;
-  centroid(sa, na, &ca);
-  centroid(sb, nb, &cb);
-  ksync_rigid_identity(&best);
-  search_grid(0.f, sa, na, sb, nb, &ca, &cb, thresh, &best, &best_score, &best_inl);
-  search_grid(180.f, sa, na, sb, nb, &ca, &cb, thresh, &best, &best_score, &best_inl);
+  na = copy_pts(v1, &pa);
+  nb = copy_pts(v2, &pb);
+  if (na < 30 || nb < 30) goto fail;
+  if (hash_build(&hash, pa, na, KSYNC_MATCH_M) != 0) goto fail;
+  centroid(pa, na, &ca);
+  centroid(pb, nb, &cb);
+  if (nb > 2500) {
+    qb = (ksync_v3 *)malloc(sizeof(*qb) * 2400);
+    if (!qb) goto fail;
+    nq = voxel_keep(pb, nb, qb, 2400, 0.10f);
+    if (nq < 30) goto fail;
+  } else {
+    qb = pb;
+    nq = nb;
+  }
 
-  /* Walk yaw, pitch, roll, then translation. Full overlap locks the rotation;
-   * the steps pull a partial overlap off the centroid guess. */
-  for (iter = 0; iter < 18; iter++) {
-    float steps[6] = {2.f, 2.f, 2.f, 0.02f, 0.02f, 0.02f};
-    int improved = 0;
-    ksync_rigid_ypr(&best, &yaw, &pitch);
-    roll = atan2f(best.R[3], best.R[4]) * (180.f / (float)M_PI);
-    for (ax = 0; ax < 6; ax++) {
-      int dir;
-      for (dir = -1; dir <= 1; dir += 2) {
-        float sc, y2 = yaw, p2 = pitch, r2 = roll;
-        float t2[3] = {best.t[0], best.t[1], best.t[2]};
-        int inl = 0;
-        if (ax == 0) y2 += dir * steps[0];
-        else if (ax == 1) p2 += dir * steps[1];
-        else if (ax == 2) r2 += dir * steps[2];
-        else
-          t2[ax - 3] += dir * steps[ax];
-        ksync_R_ypr(y2, p2, r2, trial.R);
-        if (ax < 3)
-          t_from_centroids(&ca, &cb, trial.R, trial.t);
-        else {
-          trial.t[0] = t2[0];
-          trial.t[1] = t2[1];
-          trial.t[2] = t2[2];
-        }
-        sc = score_rt(sa, na, sb, nb, trial.R, trial.t, thresh, &inl);
-        if (sc + 1e-5f < best_score) {
-          best_score = sc;
-          best = trial;
-          best_inl = inl;
-          improved = 1;
+  /* Same-scene fit. Translation stays on the centroids so a symmetric
+   * corridor cannot slide one view onto the other and call it aligned. */
+  ksync_rigid_identity(&cent);
+  ksync_rigid_identity(&face);
+  for (base = 0; base <= 180; base += 180) {
+    for (ys = -5; ys <= 5; ys++) {
+      float yaw_i = (float)base + (float)ys * 4.f;
+      for (ps = -2; ps <= 2; ps++) {
+        float pitch_i = (float)ps * 8.f;
+        for (rs = -1; rs <= 1; rs++) {
+          ksync_rigid trial;
+          float mean = 1.f;
+          int inl = 0;
+          rigid_from_ypr(yaw_i, pitch_i, (float)rs * 8.f, &ca, &cb, &trial);
+          hash_count(&hash, qb, nq, trial.R, trial.t, KSYNC_MATCH_M, &inl, &mean);
+          if (pose_better(inl, mean, cent_inl, cent_mean)) {
+            cent = trial;
+            cent_inl = inl;
+            cent_mean = mean;
+          }
         }
       }
     }
-    if (!improved) thresh = thresh > 0.06f ? thresh * 0.85f : thresh;
   }
 
-  if (best_inl < 25 || best_score > 0.08f) return -1;
-  *out = best;
+  /* Facing pair: the other camera sits metres along +Z, turned around.
+   * Left of one view is right of the other, so centroids do not correspond. */
+  {
+    static const float tz_s[] = {3.2f, 4.2f, 5.2f, 6.0f, 6.8f};
+    static const float ty_s[] = {-0.3f, 0.15f, 0.55f};
+    static const float tx_s[] = {-0.45f, -0.1f, 0.25f};
+    static const float yaw_s[] = {172.f, 180.f, 188.f};
+    static const float pitch_s[] = {0.f, 8.f, 16.f};
+    static const float roll_s[] = {-8.f, 0.f, 8.f};
+    int iz, iy, ix, iw, ip, ir;
+    for (iz = 0; iz < 5; iz++) {
+      for (iy = 0; iy < 3; iy++) {
+        for (ix = 0; ix < 3; ix++) {
+          for (iw = 0; iw < 3; iw++) {
+            for (ip = 0; ip < 3; ip++) {
+              for (ir = 0; ir < 3; ir++) {
+                float t[3] = {tx_s[ix], ty_s[iy], tz_s[iz]};
+                if (consider_pose(&hash, qb, nq, yaw_s[iw], pitch_s[ip], roll_s[ir], t, &face,
+                                  &face_inl, &face_mean)) {
+                  face_yaw = yaw_s[iw];
+                  face_pitch = pitch_s[ip];
+                  face_roll = roll_s[ir];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (face_inl > 0)
+    descend_facing(&hash, qb, nq, &face_yaw, &face_pitch, &face_roll, &face, &face_inl,
+                   &face_mean);
+
+  hash_count(&hash, pb, nb, cent.R, cent.t, KSYNC_MATCH_M, &cent_inl, &cent_mean);
+  hash_count(&hash, pb, nb, face.R, face.t, KSYNC_MATCH_M, &face_inl, &face_mean);
+  ksync_rigid_ypr(&face, &yaw, NULL);
+  /* Majority overlap is one scene seen twice (the synthetic pair, or two
+   * cameras on the same wall). Anything thinner has to be the facing room:
+   * yaw near 180 and the cameras metres apart. A close stack is not a map. */
+  accept_cent = cent_inl * 2 >= nb && cent_mean <= 0.08f;
+  accept_face = face_inl * 6 >= nb && face_mean <= KSYNC_MATCH_M &&
+                sqrtf(face.t[0] * face.t[0] + face.t[1] * face.t[1] + face.t[2] * face.t[2]) > 1.5f &&
+                fabsf(fabsf(yaw) - 180.f) < 25.f;
+  use_face = accept_face && (!accept_cent || face_inl > cent_inl);
+  if (use_face) {
+    chosen = face;
+    full_inl = face_inl;
+    full_mean = face_mean;
+  } else if (accept_cent) {
+    chosen = cent;
+    full_inl = cent_inl;
+    full_mean = cent_mean;
+  } else {
+    if (res) {
+      int show_face = face_inl >= cent_inl;
+      res->ok = 0;
+      res->inliers = show_face ? face_inl : cent_inl;
+      res->residual_m = show_face ? face_mean : cent_mean;
+      ksync_rigid_ypr(show_face ? &face : &cent, &res->yaw_deg, &res->pitch_deg);
+    }
+    goto fail;
+  }
+  *out = chosen;
   if (res) {
     res->ok = 1;
-    res->residual_m = best_score;
-    res->inliers = best_inl;
-    ksync_rigid_ypr(&best, &res->yaw_deg, &res->pitch_deg);
+    res->residual_m = full_mean;
+    res->inliers = full_inl;
+    ksync_rigid_ypr(&chosen, &res->yaw_deg, &res->pitch_deg);
   }
+  free(hash.next);
+  free(pa);
+  free(pb);
+  if (qb != pb) free(qb);
   return 0;
+
+fail:
+  free(hash.next);
+  free(pa);
+  free(pb);
+  if (qb && qb != pb) free(qb);
+  return -1;
 }

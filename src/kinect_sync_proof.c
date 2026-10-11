@@ -166,6 +166,80 @@ int main(void) {
     cube_cloud_free(&face);
   }
 
+  /* Two views of one corridor from opposite ends. Each keeps its own near
+   * half plus the shared middle, so the centroids are not the same point. */
+  {
+    cube_cloud near_end, far_end;
+    ksync_rigid got;
+    ksync_align_result room_ar;
+    float x, y, z;
+    cube_cloud_init(&near_end);
+    cube_cloud_init(&far_end);
+    cube_cloud_reserve(&near_end, 4000);
+    cube_cloud_reserve(&far_end, 4000);
+    for (x = -1.0f; x <= 1.01f; x += 0.2f) {
+      for (z = 0.8f; z <= 5.21f; z += 0.2f) {
+        cube_cloud_pt p;
+        p.x = x;
+        p.y = 0.f;
+        p.z = z;
+        p.r = p.g = p.b = 0;
+        if (z <= 3.6f) near_end.pt[near_end.n++] = p;
+        if (z >= 2.2f) {
+          cube_cloud_pt q = p;
+          rot_y(180.f, p.x - 0.12f, p.y - 0.2f, p.z - 5.0f, &q.x, &q.y, &q.z);
+          if (q.z >= 0.6f && q.z <= 3.8f) far_end.pt[far_end.n++] = q;
+        }
+      }
+    }
+    for (y = 0.2f; y <= 1.41f; y += 0.2f) {
+      for (z = 0.8f; z <= 5.21f; z += 0.2f) {
+        cube_cloud_pt p;
+        p.x = -1.f;
+        p.y = y;
+        p.z = z;
+        p.r = p.g = p.b = 0;
+        if (z <= 3.6f) near_end.pt[near_end.n++] = p;
+        if (z >= 2.2f) {
+          cube_cloud_pt q = p;
+          rot_y(180.f, p.x - 0.12f, p.y - 0.2f, p.z - 5.0f, &q.x, &q.y, &q.z);
+          if (q.z >= 0.6f && q.z <= 3.8f) far_end.pt[far_end.n++] = q;
+        }
+      }
+    }
+    for (x = -1.f; x <= 1.01f; x += 0.25f) {
+      for (y = 0.f; y <= 1.21f; y += 0.25f) {
+        cube_cloud_pt p;
+        p.x = x;
+        p.y = y;
+        p.z = 0.7f;
+        p.r = p.g = p.b = 40;
+        near_end.pt[near_end.n++] = p;
+        p.z = 5.1f;
+        rot_y(180.f, p.x - 0.12f, p.y - 0.2f, p.z - 5.0f, &p.x, &p.y, &p.z);
+        far_end.pt[far_end.n++] = p;
+      }
+    }
+    near_end.ok = near_end.n > 30;
+    far_end.ok = far_end.n > 30;
+    ksync_rigid_identity(&got);
+    memset(&room_ar, 0, sizeof room_ar);
+    expect(ksync_align(&got, &room_ar, &near_end, &far_end) == 0, "corridor align");
+    if (room_ar.ok) {
+      fprintf(stderr, "corridor residual=%.4f inliers=%d yaw=%.2f pitch=%.2f t=%.2f %.2f %.2f\n",
+              room_ar.residual_m, room_ar.inliers, room_ar.yaw_deg, room_ar.pitch_deg, got.t[0],
+              got.t[1], got.t[2]);
+      expect(fabsf(fabsf(room_ar.yaw_deg) - 180.f) < 10.f, "corridor yaw");
+      expect(room_ar.residual_m < 0.08f, "corridor residual");
+      /* A flat corridor is unchanged along its length, so the fit may sit
+       * a metre off the true baseline. It still has to face the other way
+       * and keep the cameras metres apart. */
+      expect(fabsf(got.t[2]) > 2.5f, "corridor baseline");
+    }
+    cube_cloud_free(&near_end);
+    cube_cloud_free(&far_end);
+  }
+
   expect(ksync_rigid_save(&rig, path) == 0, "save rigid");
   ksync_rigid_identity(&id);
   expect(ksync_rigid_load(&id, path) == 0, "load rigid");
